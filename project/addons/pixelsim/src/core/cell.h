@@ -13,6 +13,10 @@ struct Cell {
     uint8_t flags = 0;
 
     static constexpr uint8_t FLAG_UPDATED_THIS_STEP = 1 << 0;
+    // See MATERIAL_REACTIONS.md "Infinite-Loop / Same-Pass Protection" - a
+    // cell may participate in at most one reaction per pass. Uses an
+    // already-unused bit of `flags`, so sizeof(Cell) does not change.
+    static constexpr uint8_t FLAG_REACTED_THIS_STEP = 1 << 1;
 
     MaterialType get_material() const { return static_cast<MaterialType>(material); }
     void set_material(MaterialType m) { material = static_cast<uint8_t>(m); }
@@ -20,6 +24,10 @@ struct Cell {
     bool is_updated() const { return (flags & FLAG_UPDATED_THIS_STEP) != 0; }
     void mark_updated() { flags |= FLAG_UPDATED_THIS_STEP; }
     void clear_updated() { flags &= ~FLAG_UPDATED_THIS_STEP; }
+
+    bool is_reacted() const { return (flags & FLAG_REACTED_THIS_STEP) != 0; }
+    void mark_reacted() { flags |= FLAG_REACTED_THIS_STEP; }
+    void clear_reacted() { flags &= ~FLAG_REACTED_THIS_STEP; }
 };
 
 static_assert(sizeof(Cell) == 2, "Cell must stay a tiny POD - do not add heavy fields");

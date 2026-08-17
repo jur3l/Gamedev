@@ -34,6 +34,8 @@ public:
         MATERIAL_WOOD,
         MATERIAL_METAL,
         MATERIAL_GRAVEL,
+        MATERIAL_MUD,
+        MATERIAL_LAVA,
     };
 
     // Mirrors pixelsim::MiningShape 1:1 - exposed as PixelSimWorld.SHAPE_CIRCLE

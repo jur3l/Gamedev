@@ -100,6 +100,7 @@ public:
         dirty_this_pass = false;
         for (Cell &c : cells) {
             c.clear_updated();
+            c.clear_reacted();
         }
     }
 

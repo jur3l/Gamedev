@@ -74,6 +74,8 @@ void PixelSimWorld::_bind_methods() {
     BIND_ENUM_CONSTANT(MATERIAL_WOOD);
     BIND_ENUM_CONSTANT(MATERIAL_METAL);
     BIND_ENUM_CONSTANT(MATERIAL_GRAVEL);
+    BIND_ENUM_CONSTANT(MATERIAL_MUD);
+    BIND_ENUM_CONSTANT(MATERIAL_LAVA);
 
     BIND_ENUM_CONSTANT(SHAPE_CIRCLE);
     BIND_ENUM_CONSTANT(SHAPE_SQUARE);
@@ -107,6 +109,8 @@ Dictionary PixelSimWorld::step_simulation(double delta) {
     d["pass_completed"] = last_stats_.pass_completed;
     d["cells_evaluated"] = static_cast<int64_t>(last_stats_.cells_evaluated);
     d["cells_moved"] = static_cast<int64_t>(last_stats_.cells_moved);
+    d["reaction_checks"] = static_cast<int64_t>(last_stats_.reaction_checks);
+    d["reactions_executed"] = static_cast<int64_t>(last_stats_.reactions_executed);
     d["active_chunks"] = last_stats_.active_chunks;
     d["sleeping_chunks"] = last_stats_.sleeping_chunks;
     d["total_chunks"] = last_stats_.total_chunks;
@@ -282,6 +286,8 @@ Dictionary PixelSimWorld::get_stats() const {
     d["pass_completed"] = last_stats_.pass_completed;
     d["cells_evaluated"] = static_cast<int64_t>(last_stats_.cells_evaluated);
     d["cells_moved"] = static_cast<int64_t>(last_stats_.cells_moved);
+    d["reaction_checks"] = static_cast<int64_t>(last_stats_.reaction_checks);
+    d["reactions_executed"] = static_cast<int64_t>(last_stats_.reactions_executed);
     d["active_chunks"] = last_stats_.active_chunks;
     d["sleeping_chunks"] = last_stats_.sleeping_chunks;
     d["total_chunks"] = last_stats_.total_chunks;

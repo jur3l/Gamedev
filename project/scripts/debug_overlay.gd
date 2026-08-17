@@ -66,9 +66,10 @@ func _process(_delta: float) -> void:
 	text += "Simulation: %.3f ms | pass complete: %s\n" % [stats.get("sim_ms", 0.0), stats.get("pass_completed", false)]
 	text += "Chunks: active=%d sleeping=%d total=%d\n" % [stats.get("active_chunks", 0), stats.get("sleeping_chunks", 0), stats.get("total_chunks", 0)]
 	text += "Cells: total=%s evaluated/step=%d moved/step=%d\n" % [_fmt(stats.get("total_cells", 0)), stats.get("cells_evaluated", 0), stats.get("cells_moved", 0)]
+	text += "Reactions: checks/step=%d executed/step=%d\n" % [stats.get("reaction_checks", 0), stats.get("reactions_executed", 0)]
 	text += "\nIron Ore: %d   Copper Ore: %d\n" % [main.get_resource(sim_world.MATERIAL_IRON_ORE), main.get_resource(sim_world.MATERIAL_COPPER_ORE)]
 	text += "\n[F1] toggle chunk debug view   [9] toggle material inspector\n"
-	text += "[1] wood [2] metal   LMB mine / RMB build\n"
+	text += "[1] wood [2] metal [3] water [4] lava   LMB mine / RMB build\n"
 	text += "Mining tool: %s, size=%d   [ ] resize   [T] toggle shape\n" % [mining_building.mining_shape_name(), mining_building.mining_size]
 	text += "[1-5 with Shift] stress test tiers: 10k/50k/100k/250k/500k sand"
 	if main.has_method("get_stress_test_report"):

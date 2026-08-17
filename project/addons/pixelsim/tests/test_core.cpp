@@ -4,14 +4,17 @@
 //
 // Build (from a VS dev prompt, no other dependencies required):
 //   cl /std:c++17 /EHsc /I ..\src test_core.cpp ..\src\core\material.cpp
-//      ..\src\core\background.cpp ..\src\core\world.cpp ..\src\solvers\solvers.cpp
+//      ..\src\core\background.cpp ..\src\core\reaction.cpp ..\src\core\world.cpp
+//      ..\src\solvers\solvers.cpp ..\src\solvers\reaction_solver.cpp
 //      ..\src\gen\terrain_gen.cpp /Fe:test_core.exe
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include "../src/core/background.h"
 #include "../src/core/material.h"
+#include "../src/core/reaction.h"
 #include "../src/core/world.h"
+#include "../src/solvers/reaction_solver.h"
 
 using namespace pixelsim;
 
@@ -844,6 +847,563 @@ static void test_mining_drop_material_classification() {
     CHECK(get_material_def(MaterialType::METAL).is_mining_drop == false);
 }
 
+// ---- Material Reaction System (see MATERIAL_REACTIONS.md) ----
+// Function names mirror MATERIAL_REACTIONS.md's "Testing Requirements" list
+// 1:1 so each scenario there is traceable to exactly one test here.
+//
+// The demo reaction is WATER + DIRT -> AIR + MUD. STONE is deliberately used
+// throughout as the "safe, inert" filler/floor/wall material in these tests
+// (matching the rest of this file's existing convention) precisely because
+// it does NOT participate in this reaction - unlike an earlier draft of this
+// reaction (WATER + STONE), which broke that codebase-wide assumption (see
+// test_water_falls_then_spreads, which relies on STONE as an inert floor
+// under WATER) and is why DIRT was chosen as the reactant instead.
+
+// 1. A+B adjacency (horizontal).
+static void test_reaction_fires_adjacent_horizontal() {
+    std::printf("test_reaction_fires_adjacent_horizontal\n");
+    World world(1, 1, 40);
+    world.set_cell(5, 5, MaterialType::WATER);
+    world.set_cell(6, 5, MaterialType::DIRT);
+    run_full_pass(world);
+    CHECK(world.get_material(5, 5) == MaterialType::AIR);
+    CHECK(world.get_material(6, 5) == MaterialType::MUD);
+}
+
+// 2. B+A adjacency / symmetric matching - proven at both the pure
+// find_reaction() level (the definitive check) and via world placement with
+// DIRT on the other side of WATER.
+static void test_reaction_matching_is_symmetric() {
+    std::printf("test_reaction_matching_is_symmetric\n");
+    MaterialType r1, r2;
+    float prob;
+    CHECK(find_reaction(MaterialType::WATER, MaterialType::DIRT, r1, r2, prob));
+    CHECK(r1 == MaterialType::AIR);
+    CHECK(r2 == MaterialType::MUD);
+
+    CHECK(find_reaction(MaterialType::DIRT, MaterialType::WATER, r1, r2, prob));
+    CHECK(r1 == MaterialType::MUD);
+    CHECK(r2 == MaterialType::AIR);
+
+    World world(1, 1, 41);
+    world.set_cell(4, 5, MaterialType::DIRT); // DIRT to the LEFT this time
+    world.set_cell(5, 5, MaterialType::WATER);
+    run_full_pass(world);
+    CHECK(world.get_material(4, 5) == MaterialType::MUD);
+    CHECK(world.get_material(5, 5) == MaterialType::AIR);
+}
+
+// 3. Non-adjacent reactants never react.
+static void test_reaction_no_fire_when_not_adjacent() {
+    std::printf("test_reaction_no_fire_when_not_adjacent\n");
+    World world(1, 1, 42);
+    // WATER fully boxed by non-reactive STONE (all 4 orthogonal neighbors
+    // AND both diagonal-down cells, so it can't move either) - none of its
+    // neighbors is ever DIRT.
+    world.set_cell(5, 5, MaterialType::WATER);
+    world.set_cell(5, 4, MaterialType::STONE);
+    world.set_cell(5, 6, MaterialType::STONE);
+    world.set_cell(4, 5, MaterialType::STONE);
+    world.set_cell(6, 5, MaterialType::STONE);
+    world.set_cell(4, 6, MaterialType::STONE); // diagonal-down (solve_liquid)
+    world.set_cell(6, 6, MaterialType::STONE); // diagonal-down (solve_liquid)
+    world.set_cell(5, 2, MaterialType::DIRT); // exists, but not adjacent
+    run_full_pass(world);
+    CHECK(world.get_material(5, 5) == MaterialType::WATER);
+    CHECK(world.get_material(5, 2) == MaterialType::DIRT);
+}
+
+// 4. Adjacent pair with no matching ReactionDefinition is a no-op.
+static void test_reaction_no_fire_when_no_definition() {
+    std::printf("test_reaction_no_fire_when_no_definition\n");
+    World world(1, 1, 43);
+    world.set_cell(5, 5, MaterialType::SAND);
+    world.set_cell(5, 6, MaterialType::STONE); // floor (SAND+STONE has no reaction either)
+    world.set_cell(4, 6, MaterialType::STONE);
+    world.set_cell(6, 6, MaterialType::STONE);
+    world.set_cell(6, 5, MaterialType::IRON_ORE); // adjacent, undefined pair
+    run_full_pass(world);
+    CHECK(world.get_material(5, 5) == MaterialType::SAND);
+    CHECK(world.get_material(6, 5) == MaterialType::IRON_ORE);
+}
+
+// 5. Correct cell mutation, vertical adjacency (result_a/result_b mapped to
+// the right coordinates, not swapped).
+static void test_reaction_mutates_correct_cells() {
+    std::printf("test_reaction_mutates_correct_cells\n");
+    World world(1, 1, 44);
+    world.set_cell(5, 5, MaterialType::WATER);
+    world.set_cell(5, 6, MaterialType::DIRT);
+    run_full_pass(world);
+    CHECK(world.get_material(5, 5) == MaterialType::AIR);
+    CHECK(world.get_material(5, 6) == MaterialType::MUD);
+}
+
+// 6. The reaction product is a normal, immediately-simulatable cell.
+static void test_reaction_product_participates_in_simulation() {
+    std::printf("test_reaction_product_participates_in_simulation\n");
+    World world(1, 1, 45);
+    world.set_cell(5, 4, MaterialType::SAND);  // above the water
+    world.set_cell(5, 5, MaterialType::WATER);
+    world.set_cell(5, 6, MaterialType::DIRT);  // reaction partner, below water
+    world.set_cell(4, 5, MaterialType::STONE); // wall off diagonals so SAND
+    world.set_cell(6, 5, MaterialType::STONE); // can only fall straight down
+    run_full_pass(world);
+    // Row 6 (DIRT) then row 5 (WATER, reacts) resolve before row 4 (SAND) in
+    // the same bottom-to-top pass, so SAND falls into the freshly-AIR (5,5)
+    // within this SAME pass - proving the product isn't a dead cell.
+    CHECK(world.get_material(5, 4) == MaterialType::AIR);
+    CHECK(world.get_material(5, 5) == MaterialType::SAND);
+    CHECK(world.get_material(5, 6) == MaterialType::MUD);
+}
+
+// 7. Chunk boundary correctness.
+static void test_reaction_chunk_boundary() {
+    std::printf("test_reaction_chunk_boundary\n");
+    World world(2, 1, 46);
+    int boundary_x = CHUNK_SIZE - 1;
+    world.set_cell(boundary_x, 5, MaterialType::WATER);
+    world.set_cell(boundary_x + 1, 5, MaterialType::DIRT);
+    run_full_pass(world);
+    CHECK(world.get_material(boundary_x, 5) == MaterialType::AIR);
+    CHECK(world.get_material(boundary_x + 1, 5) == MaterialType::MUD);
+    CHECK(world.chunk_at(0, 0).sleeping == false || world.chunk_at(0, 0).dirty_this_pass);
+    CHECK(world.chunk_at(1, 0).sleeping == false || world.chunk_at(1, 0).dirty_this_pass);
+}
+
+// 8. Sleeping/wake compatibility - a reaction placed into a settled world
+// wakes its chunk the normal way and the chunk settles back to sleep after
+// (MUD is STATIC, so there's no further movement to keep the chunk awake).
+static void test_reaction_sleep_wake_compatibility() {
+    std::printf("test_reaction_sleep_wake_compatibility\n");
+    World world(1, 1, 47);
+    world.set_cell(20, 20, MaterialType::STONE); // unrelated write, settles the chunk
+    run_full_pass(world);
+    run_full_pass(world);
+    CHECK(world.chunk_at(0, 0).sleeping == true);
+
+    world.set_cell(5, 5, MaterialType::WATER);
+    world.set_cell(5, 6, MaterialType::DIRT); // reaction partner
+    CHECK(world.chunk_at(0, 0).sleeping == false); // woken immediately by set_cell
+
+    run_full_pass(world); // reaction fires this pass
+    CHECK(world.get_material(5, 5) == MaterialType::AIR);
+    CHECK(world.get_material(5, 6) == MaterialType::MUD);
+
+    run_full_pass(world); // genuinely quiet pass -> settles back to sleep
+    CHECK(world.chunk_at(0, 0).sleeping == true);
+}
+
+// 9. Background layer is structurally excluded.
+static void test_reaction_background_excluded() {
+    std::printf("test_reaction_background_excluded\n");
+    World world(1, 1, 48);
+    world.set_background(5, 5, BackgroundType::DARK_ROCK);
+    world.set_background(5, 6, BackgroundType::DARK_ROCK);
+    world.set_cell(5, 5, MaterialType::WATER);
+    world.set_cell(5, 6, MaterialType::DIRT);
+    run_full_pass(world);
+    CHECK(world.get_material(5, 5) == MaterialType::AIR);
+    CHECK(world.get_material(5, 6) == MaterialType::MUD);
+    CHECK(world.get_background(5, 5) == BackgroundType::DARK_ROCK);
+    CHECK(world.get_background(5, 6) == BackgroundType::DARK_ROCK);
+}
+
+// 10. Mining/drop-ratio regression - unaffected by the reaction system.
+static void test_reaction_mining_regression() {
+    std::printf("test_reaction_mining_regression\n");
+    World world(1, 1, 49);
+    world.fill_rect(2, 2, 10, 1, MaterialType::DIRT);
+    MineResult rd = world.mine_area(6, 2, 10, MiningShape::SQUARE);
+    CHECK(rd.counts[static_cast<int>(MaterialType::DIRT)] == 10);
+    CHECK(count_material_in_rect(world, 2, 2, 10, 1, MaterialType::SAND) == 5);
+    CHECK(count_material_in_rect(world, 2, 2, 10, 1, MaterialType::AIR) == 5);
+
+    world.fill_rect(2, 10, 10, 1, MaterialType::STONE);
+    MineResult rs = world.mine_area(6, 10, 10, MiningShape::SQUARE);
+    CHECK(rs.counts[static_cast<int>(MaterialType::STONE)] == 10);
+    CHECK(count_material_in_rect(world, 2, 10, 10, 1, MaterialType::GRAVEL) == 5);
+    CHECK(count_material_in_rect(world, 2, 10, 10, 1, MaterialType::AIR) == 5);
+}
+
+// 11. No full-world scan - a small reactive region in a large stable world
+// wakes only a small, bounded number of chunks. The ambient STONE fill is
+// safe to embed the reactive pair in/near since STONE no longer reacts.
+static void test_reaction_no_full_world_scan() {
+    std::printf("test_reaction_no_full_world_scan\n");
+    World world(4, 4, 50); // 16 chunks
+    world.fill_rect(0, 0, world.width_cells(), world.height_cells() / 2, MaterialType::STONE);
+    for (int i = 0; i < 5; ++i) {
+        run_full_pass(world);
+    }
+    CHECK(count_active_chunks(world) == 0);
+
+    world.set_cell(32, 32, MaterialType::WATER); // interior, far from any chunk edge
+    world.set_cell(33, 32, MaterialType::DIRT);
+    int active = count_active_chunks(world);
+    CHECK(active >= 1);
+    CHECK(active <= 6); // same bounded-activation ceiling as any ordinary world change
+
+    run_full_pass(world);
+    CHECK(world.get_material(32, 32) == MaterialType::AIR);
+    CHECK(world.get_material(33, 32) == MaterialType::MUD);
+    CHECK(count_active_chunks(world) < world.width_chunks() * world.height_chunks());
+}
+
+// 12. Determinism - same seed, same actions -> identical resulting grid.
+static void test_reaction_determinism() {
+    std::printf("test_reaction_determinism\n");
+    World world_a(2, 2, 51);
+    World world_b(2, 2, 51);
+    auto setup = [](World &w) {
+        w.set_cell(10, 10, MaterialType::WATER);
+        w.set_cell(11, 10, MaterialType::DIRT);
+        w.set_cell(50, 50, MaterialType::SAND);
+        w.set_cell(50, 51, MaterialType::WATER);
+    };
+    setup(world_a);
+    setup(world_b);
+    for (int i = 0; i < 10; ++i) {
+        world_a.step(1000.0);
+        world_b.step(1000.0);
+    }
+    for (int y = 0; y < world_a.height_cells(); ++y) {
+        for (int x = 0; x < world_a.width_cells(); ++x) {
+            CHECK(world_a.get_material(x, y) == world_b.get_material(x, y));
+        }
+    }
+}
+
+// 13. Same-pass loop / infinite-chain protection.
+static void test_reaction_same_pass_loop_protection() {
+    std::printf("test_reaction_same_pass_loop_protection\n");
+
+    // Sub-case A: DIRT-WATER-DIRT - the single WATER anchor reacts with at
+    // most one neighbor per visit (fixed up/down/left/right order - left
+    // wins here), never both in the same pass.
+    {
+        World world(1, 1, 52);
+        world.set_cell(4, 5, MaterialType::DIRT);
+        world.set_cell(5, 5, MaterialType::WATER);
+        world.set_cell(6, 5, MaterialType::DIRT);
+        run_full_pass(world);
+        CHECK(world.get_material(4, 5) == MaterialType::MUD);
+        CHECK(world.get_material(5, 5) == MaterialType::AIR);
+        CHECK(world.get_material(6, 5) == MaterialType::DIRT); // untouched
+    }
+
+    // Sub-case B: WATER-DIRT-WATER - two independent anchors share one
+    // neighbor. Only whichever is visited first this pass reacts; the
+    // reacted-flag on the shared (now MUD) neighbor blocks the other.
+    {
+        World world(1, 1, 53);
+        for (int x = 3; x <= 7; ++x) {
+            world.set_cell(x, 6, MaterialType::STONE); // floor, non-reactive
+        }
+        world.set_cell(3, 5, MaterialType::STONE); // outer walls so the
+        world.set_cell(7, 5, MaterialType::STONE); // un-reacted WATER can't drift
+        world.set_cell(4, 5, MaterialType::WATER);
+        world.set_cell(5, 5, MaterialType::DIRT);
+        world.set_cell(6, 5, MaterialType::WATER);
+        run_full_pass(world);
+
+        bool left_reacted = world.get_material(4, 5) == MaterialType::AIR;
+        bool right_reacted = world.get_material(6, 5) == MaterialType::AIR;
+        CHECK(left_reacted != right_reacted); // exactly one side, never both
+        CHECK(world.get_material(5, 5) == MaterialType::MUD);
+        if (!left_reacted) CHECK(world.get_material(4, 5) == MaterialType::WATER);
+        if (!right_reacted) CHECK(world.get_material(6, 5) == MaterialType::WATER);
+    }
+}
+
+// 14. Probability mechanism, unit-level, reusing the existing RNG stream's
+// output shape (fixed rand_value in, deterministic bool out) - no non-1.0
+// reaction is defined yet, so this exercises the mechanism directly.
+static void test_reaction_probability_mechanism() {
+    std::printf("test_reaction_probability_mechanism\n");
+    CHECK(roll_reaction_probability(0u, 1.0f) == true);
+    CHECK(roll_reaction_probability(0xFFFFFFFFu, 1.0f) == true);
+    CHECK(roll_reaction_probability(0u, 2.0f) == true); // misconfigured >1.0 still guaranteed
+
+    CHECK(roll_reaction_probability(0u, 0.0f) == false);
+    CHECK(roll_reaction_probability(0xFFFFFFFFu, 0.0f) == false);
+
+    CHECK(roll_reaction_probability(0u, 0.5f) == true);
+    CHECK(roll_reaction_probability(999999u, 0.5f) == false);
+}
+
+// ---- Material Ecosystem (see MATERIALS.md) ----
+// The only genuinely NEW material here is LAVA (DIRT/SAND/STONE/GRAVEL/WATER
+// already existed and are re-verified by the pre-existing tests above simply
+// by being part of this same suite run). LAVA is MovementBehavior::LIQUID
+// and reuses solve_liquid verbatim - no separate solve_lava().
+
+static void test_lava_falls() {
+    std::printf("test_lava_falls\n");
+    World world(1, 1, 60);
+    world.set_cell(5, 5, MaterialType::LAVA);
+    run_full_pass(world);
+    CHECK(world.get_material(5, 5) == MaterialType::AIR);
+    CHECK(world.get_material(5, 6) == MaterialType::LAVA);
+}
+
+static void test_lava_flows_sideways() {
+    std::printf("test_lava_flows_sideways\n");
+    World world(1, 1, 61);
+    world.set_cell(32, 5, MaterialType::LAVA);
+    world.set_cell(30, 6, MaterialType::STONE);
+    world.set_cell(31, 6, MaterialType::STONE);
+    world.set_cell(32, 6, MaterialType::STONE);
+    world.set_cell(33, 6, MaterialType::STONE);
+    world.set_cell(34, 6, MaterialType::STONE);
+    run_full_pass(world);
+    bool spread = world.get_material(31, 5) == MaterialType::LAVA ||
+                  world.get_material(33, 5) == MaterialType::LAVA;
+    CHECK(spread);
+}
+
+// SAND (density 1.6) sinking through WATER (density 1.0) inside a sealed
+// STONE tube: proves the density/displacement rule works end to end - the
+// SAND settles at the bottom, none of the 3 WATER cells disappear or
+// duplicate, and it stabilizes (no infinite swap loop).
+static void test_sand_sinks_through_water() {
+    std::printf("test_sand_sinks_through_water\n");
+    World world(1, 1, 62);
+    int cx = 10, floor_y = 20;
+    world.set_cell(cx - 1, floor_y, MaterialType::STONE);
+    world.set_cell(cx, floor_y, MaterialType::STONE);
+    world.set_cell(cx + 1, floor_y, MaterialType::STONE);
+    // Walls must extend one row past the topmost WATER cell (dy=4) too, not
+    // just alongside the water itself (dy=1..3) - otherwise the WATER a
+    // sinking SAND/GRAVEL displaces upward has an open side at dy=4 to
+    // escape through sideways, then fall out of the tube entirely via the
+    // (unwalled) column just beyond dx=+-1, which is what the original
+    // dy<=3 version of this test actually did.
+    for (int dy = 1; dy <= 4; ++dy) {
+        world.set_cell(cx - 1, floor_y - dy, MaterialType::STONE);
+        world.set_cell(cx + 1, floor_y - dy, MaterialType::STONE);
+    }
+    world.set_cell(cx, floor_y - 1, MaterialType::WATER);
+    world.set_cell(cx, floor_y - 2, MaterialType::WATER);
+    world.set_cell(cx, floor_y - 3, MaterialType::WATER);
+    world.set_cell(cx, floor_y - 5, MaterialType::SAND);
+
+    bool stabilized = false;
+    for (int i = 0; i < 20; ++i) {
+        StepStats stats = world.step(1000.0);
+        while (!stats.pass_completed) stats = world.step(1000.0);
+        if (stats.active_chunks == 0) {
+            stabilized = true;
+            break;
+        }
+    }
+    CHECK(stabilized); // settles - no infinite swap loop
+
+    CHECK(world.get_material(cx, floor_y - 1) == MaterialType::SAND); // sank to the bottom
+    int water_count = count_material_in_rect(world, cx - 1, floor_y - 6, 3, 6, MaterialType::WATER);
+    int sand_count = count_material_in_rect(world, cx - 1, floor_y - 6, 3, 6, MaterialType::SAND);
+    CHECK(water_count == 3); // none of the water disappeared
+    CHECK(sand_count == 1);  // sand didn't duplicate or vanish
+}
+
+// Same shape as above but with GRAVEL (density 1.9) - proves the
+// density/displacement rule generalizes to a second POWDER material, not
+// just a single hardcoded SAND/WATER pairing.
+static void test_gravel_sinks_through_water() {
+    std::printf("test_gravel_sinks_through_water\n");
+    World world(1, 1, 63);
+    int cx = 10, floor_y = 20;
+    world.set_cell(cx - 1, floor_y, MaterialType::STONE);
+    world.set_cell(cx, floor_y, MaterialType::STONE);
+    world.set_cell(cx + 1, floor_y, MaterialType::STONE);
+    // See test_sand_sinks_through_water for why this must be dy<=4, not 3.
+    for (int dy = 1; dy <= 4; ++dy) {
+        world.set_cell(cx - 1, floor_y - dy, MaterialType::STONE);
+        world.set_cell(cx + 1, floor_y - dy, MaterialType::STONE);
+    }
+    world.set_cell(cx, floor_y - 1, MaterialType::WATER);
+    world.set_cell(cx, floor_y - 2, MaterialType::WATER);
+    world.set_cell(cx, floor_y - 3, MaterialType::WATER);
+    world.set_cell(cx, floor_y - 5, MaterialType::GRAVEL);
+
+    bool stabilized = false;
+    for (int i = 0; i < 20; ++i) {
+        StepStats stats = world.step(1000.0);
+        while (!stats.pass_completed) stats = world.step(1000.0);
+        if (stats.active_chunks == 0) {
+            stabilized = true;
+            break;
+        }
+    }
+    CHECK(stabilized);
+
+    CHECK(world.get_material(cx, floor_y - 1) == MaterialType::GRAVEL);
+    int water_count = count_material_in_rect(world, cx - 1, floor_y - 6, 3, 6, MaterialType::WATER);
+    int gravel_count = count_material_in_rect(world, cx - 1, floor_y - 6, 3, 6, MaterialType::GRAVEL);
+    CHECK(water_count == 3);
+    CHECK(gravel_count == 1);
+}
+
+// WATER placed on top of already-settled GRAVEL: GRAVEL must NOT move (WATER
+// isn't denser, can't displace it) and the WATER cell must not vanish - just
+// ordinary solid-floor-under-liquid behavior, the reverse density ordering
+// from the two tests above.
+static void test_water_rests_stably_on_gravel() {
+    std::printf("test_water_rests_stably_on_gravel\n");
+    World world(1, 1, 64);
+    world.set_cell(5, 7, MaterialType::STONE);  // support under the gravel
+    world.set_cell(4, 7, MaterialType::STONE);
+    world.set_cell(6, 7, MaterialType::STONE);
+    world.set_cell(5, 6, MaterialType::GRAVEL); // settled gravel floor
+    world.set_cell(4, 6, MaterialType::STONE);  // block gravel's diagonals so it can't slide off
+    world.set_cell(6, 6, MaterialType::STONE);
+    world.set_cell(5, 5, MaterialType::WATER);  // water resting on top
+    run_full_pass(world);
+    CHECK(world.get_material(5, 6) == MaterialType::GRAVEL); // didn't move
+    CHECK(world.get_material(5, 5) == MaterialType::WATER || world.get_material(4, 5) == MaterialType::WATER || world.get_material(6, 5) == MaterialType::WATER); // still exists (may have spread sideways at its own row)
+}
+
+// ---- WATER + LAVA reaction (see MATERIAL_REACTIONS.md, MATERIALS.md) ----
+
+static void test_water_lava_reaction_adjacent() {
+    std::printf("test_water_lava_reaction_adjacent\n");
+    World world(1, 1, 65);
+    world.set_cell(5, 5, MaterialType::WATER);
+    world.set_cell(6, 5, MaterialType::LAVA);
+    run_full_pass(world);
+    CHECK(world.get_material(5, 5) == MaterialType::AIR);
+    CHECK(world.get_material(6, 5) == MaterialType::STONE);
+}
+
+static void test_water_lava_reaction_chunk_boundary() {
+    std::printf("test_water_lava_reaction_chunk_boundary\n");
+    World world(2, 1, 66);
+    int boundary_x = CHUNK_SIZE - 1;
+    world.set_cell(boundary_x, 5, MaterialType::WATER);
+    world.set_cell(boundary_x + 1, 5, MaterialType::LAVA);
+    run_full_pass(world);
+    CHECK(world.get_material(boundary_x, 5) == MaterialType::AIR);
+    CHECK(world.get_material(boundary_x + 1, 5) == MaterialType::STONE);
+    CHECK(world.chunk_at(0, 0).sleeping == false || world.chunk_at(0, 0).dirty_this_pass);
+    CHECK(world.chunk_at(1, 0).sleeping == false || world.chunk_at(1, 0).dirty_this_pass);
+}
+
+// LAVA-WATER-LAVA: unlike the WATER+DIRT case, BOTH sides here are movable
+// (LIQUID) anchors, not one active + one passive-STATIC - a genuinely
+// different code path (either LAVA cell, or the WATER cell itself, could be
+// the one whose turn triggers the reaction check). Confirms the same-pass
+// reacted-flag still caps this at exactly one reaction regardless of which
+// side initiates.
+static void test_water_lava_reaction_same_pass_protection() {
+    std::printf("test_water_lava_reaction_same_pass_protection\n");
+    World world(1, 1, 67);
+    for (int x = 3; x <= 7; ++x) {
+        world.set_cell(x, 6, MaterialType::STONE); // floor, inert to both WATER and LAVA
+    }
+    world.set_cell(3, 5, MaterialType::STONE); // outer walls
+    world.set_cell(7, 5, MaterialType::STONE);
+    world.set_cell(4, 5, MaterialType::LAVA);
+    world.set_cell(5, 5, MaterialType::WATER);
+    world.set_cell(6, 5, MaterialType::LAVA);
+    run_full_pass(world);
+
+    // Which side reacts depends on scan direction (World starts on pass id 1,
+    // i.e. right-to-left - see World::current_pass_id_), so this deliberately
+    // doesn't assert WHICH side reacts, only that the invariants the same-
+    // pass guard exists to protect hold regardless of scan order:
+    MaterialType m4 = world.get_material(4, 5);
+    MaterialType m5 = world.get_material(5, 5);
+    MaterialType m6 = world.get_material(6, 5);
+
+    int stone_count = (m4 == MaterialType::STONE) + (m5 == MaterialType::STONE) + (m6 == MaterialType::STONE);
+    int lava_count = (m4 == MaterialType::LAVA) + (m5 == MaterialType::LAVA) + (m6 == MaterialType::LAVA);
+    int water_count = (m4 == MaterialType::WATER) + (m5 == MaterialType::WATER) + (m6 == MaterialType::WATER);
+
+    CHECK(stone_count == 1); // exactly one LAVA reacted, never both (same-pass guard)
+    CHECK(lava_count == 1);  // the OTHER LAVA survives - reacting at most once doesn't destroy it
+    CHECK(water_count == 0); // WATER was consumed by whichever side reacted
+    // The un-reacted LAVA is free to take its own normal movement turn this
+    // same pass (reaction and movement are exclusive PER CELL, not a freeze
+    // on the whole row) - e.g. flowing sideways into the WATER cell the
+    // moment it turns to AIR mid-pass. So the original WATER cell is not
+    // necessarily AIR afterwards; it's necessarily NOT WATER, which the
+    // water_count check above already covers.
+}
+
+// Sleep/wake compatibility for the WATER+LAVA reaction specifically -
+// mirrors test_reaction_sleep_wake_compatibility (WATER+DIRT) but with two
+// movable reactants instead of one movable + one static.
+static void test_water_lava_reaction_sleep_wake() {
+    std::printf("test_water_lava_reaction_sleep_wake\n");
+    World world(1, 1, 68);
+    world.set_cell(20, 20, MaterialType::STONE); // unrelated write, settles the chunk
+    run_full_pass(world);
+    run_full_pass(world);
+    CHECK(world.chunk_at(0, 0).sleeping == true);
+
+    world.set_cell(5, 6, MaterialType::STONE); // floor so the STONE product can't fall away
+    world.set_cell(4, 6, MaterialType::STONE);
+    world.set_cell(6, 6, MaterialType::STONE);
+    world.set_cell(5, 5, MaterialType::WATER);
+    world.set_cell(6, 5, MaterialType::LAVA);
+    CHECK(world.chunk_at(0, 0).sleeping == false); // woken immediately by set_cell
+
+    run_full_pass(world); // reaction fires this pass
+    CHECK(world.get_material(5, 5) == MaterialType::AIR);
+    CHECK(world.get_material(6, 5) == MaterialType::STONE);
+
+    run_full_pass(world); // genuinely quiet pass -> settles back to sleep
+    CHECK(world.chunk_at(0, 0).sleeping == true);
+}
+
+// Stable, settled LAVA (resting on a floor, nothing to do) goes to sleep
+// exactly like any other material - being a LIQUID is not a reason to stay
+// perpetually active.
+static void test_lava_sleep_wake() {
+    std::printf("test_lava_sleep_wake\n");
+    World world(1, 1, 69);
+    world.set_cell(5, 5, MaterialType::LAVA);
+    world.set_cell(5, 6, MaterialType::STONE); // floor
+    world.set_cell(4, 6, MaterialType::STONE); // block diagonal-down
+    world.set_cell(6, 6, MaterialType::STONE);
+    world.set_cell(4, 5, MaterialType::STONE); // block sideways spread too - a LIQUID
+    world.set_cell(6, 5, MaterialType::STONE); // with nowhere to go is what "settled" means
+    run_full_pass(world); // pass with the setup writes
+    run_full_pass(world); // genuinely quiet pass -> asleep
+    CHECK(world.get_material(5, 5) == MaterialType::LAVA); // settled, didn't move
+    CHECK(world.chunk_at(0, 0).sleeping == true);
+}
+
+static void test_material_is_reaction_capable() {
+    std::printf("test_material_is_reaction_capable\n");
+    CHECK(material_is_reaction_capable(MaterialType::WATER) == true);
+    CHECK(material_is_reaction_capable(MaterialType::DIRT) == true);
+    CHECK(material_is_reaction_capable(MaterialType::LAVA) == true);
+    CHECK(material_is_reaction_capable(MaterialType::MUD) == false);  // product, not a reactant
+    CHECK(material_is_reaction_capable(MaterialType::STONE) == false); // product, not a reactant
+    CHECK(material_is_reaction_capable(MaterialType::SAND) == false);
+    CHECK(material_is_reaction_capable(MaterialType::GRAVEL) == false);
+    CHECK(material_is_reaction_capable(MaterialType::AIR) == false);
+}
+
+// Confirms the existing mining/drop-ratio system is unaffected by LAVA's
+// addition (MATERIAL_COUNT growing by one - all the MATERIAL_COUNT-sized
+// arrays this depends on, e.g. MineResult::counts, size themselves off the
+// same constant, so this should need no code change - verified here).
+static void test_mining_regression_with_lava_present() {
+    std::printf("test_mining_regression_with_lava_present\n");
+    World world(1, 1, 71);
+    world.fill_rect(2, 2, 10, 1, MaterialType::DIRT);
+    MineResult rd = world.mine_area(6, 2, 10, MiningShape::SQUARE);
+    CHECK(rd.counts[static_cast<int>(MaterialType::DIRT)] == 10);
+    CHECK(count_material_in_rect(world, 2, 2, 10, 1, MaterialType::SAND) == 5);
+
+    world.fill_rect(2, 10, 10, 1, MaterialType::STONE);
+    MineResult rs = world.mine_area(6, 10, 10, MiningShape::SQUARE);
+    CHECK(rs.counts[static_cast<int>(MaterialType::STONE)] == 10);
+    CHECK(count_material_in_rect(world, 2, 10, 10, 1, MaterialType::GRAVEL) == 5);
+}
+
 int main() {
     test_sand_falls();
     test_sand_blocked_by_stone();
@@ -899,6 +1459,34 @@ int main() {
     test_background_memory_footprint();
 
     test_mining_drop_material_classification();
+
+    test_reaction_fires_adjacent_horizontal();
+    test_reaction_matching_is_symmetric();
+    test_reaction_no_fire_when_not_adjacent();
+    test_reaction_no_fire_when_no_definition();
+    test_reaction_mutates_correct_cells();
+    test_reaction_product_participates_in_simulation();
+    test_reaction_chunk_boundary();
+    test_reaction_sleep_wake_compatibility();
+    test_reaction_background_excluded();
+    test_reaction_mining_regression();
+    test_reaction_no_full_world_scan();
+    test_reaction_determinism();
+    test_reaction_same_pass_loop_protection();
+    test_reaction_probability_mechanism();
+
+    test_lava_falls();
+    test_lava_flows_sideways();
+    test_sand_sinks_through_water();
+    test_gravel_sinks_through_water();
+    test_water_rests_stably_on_gravel();
+    test_water_lava_reaction_adjacent();
+    test_water_lava_reaction_chunk_boundary();
+    test_water_lava_reaction_same_pass_protection();
+    test_water_lava_reaction_sleep_wake();
+    test_lava_sleep_wake();
+    test_material_is_reaction_capable();
+    test_mining_regression_with_lava_present();
 
     std::printf("\n%d/%d checks passed\n", g_checks - g_failures, g_checks);
     if (g_failures > 0) {

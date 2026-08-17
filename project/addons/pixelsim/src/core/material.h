@@ -17,6 +17,8 @@ enum class MaterialType : uint8_t {
     WOOD,
     METAL,
     GRAVEL,
+    MUD,
+    LAVA,
     COUNT
 };
 

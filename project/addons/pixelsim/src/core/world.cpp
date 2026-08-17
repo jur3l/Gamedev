@@ -3,6 +3,7 @@
 #include <cmath>
 #include <utility>
 #include <vector>
+#include "../solvers/reaction_solver.h"
 #include "../solvers/solvers.h"
 
 namespace pixelsim {
@@ -132,6 +133,20 @@ void World::mark_cell_updated(int x, int y) {
     chunk_at(cx, cy).at(lx, ly).mark_updated();
 }
 
+bool World::is_cell_reacted_this_step(int x, int y) const {
+    if (!in_bounds(x, y)) return true;
+    int cx = x / CHUNK_SIZE, lx = x % CHUNK_SIZE;
+    int cy = y / CHUNK_SIZE, ly = y % CHUNK_SIZE;
+    return chunk_at(cx, cy).at(lx, ly).is_reacted();
+}
+
+void World::mark_cell_reacted(int x, int y) {
+    if (!in_bounds(x, y)) return;
+    int cx = x / CHUNK_SIZE, lx = x % CHUNK_SIZE;
+    int cy = y / CHUNK_SIZE, ly = y % CHUNK_SIZE;
+    chunk_at(cx, cy).at(lx, ly).mark_reacted();
+}
+
 bool World::can_displace(MaterialType mover, int x, int y) const {
     if (!in_bounds(x, y)) return false;
     return material_can_displace(mover, get_material(x, y));
@@ -194,11 +209,23 @@ StepStats World::step(double simulation_budget_ms) {
                 }
                 stats.cells_evaluated++;
                 int world_x = cx * CHUNK_SIZE + local_x;
+
+                // Reaction detection piggybacks on this same visit - see
+                // MATERIAL_REACTIONS.md "Simulation Integration". A cell
+                // either reacts or attempts to move this pass, never both.
+                stats.reaction_checks++;
+                bool reacted = try_react(*this, world_x, y);
+                if (reacted) {
+                    stats.reactions_executed++;
+                }
+
                 bool moved = false;
-                if (def.behavior == MovementBehavior::POWDER) {
-                    moved = solve_powder(*this, world_x, y);
-                } else if (def.behavior == MovementBehavior::LIQUID) {
-                    moved = solve_liquid(*this, world_x, y);
+                if (!reacted) {
+                    if (def.behavior == MovementBehavior::POWDER) {
+                        moved = solve_powder(*this, world_x, y);
+                    } else if (def.behavior == MovementBehavior::LIQUID) {
+                        moved = solve_liquid(*this, world_x, y);
+                    }
                 }
                 if (moved) {
                     stats.cells_moved++;

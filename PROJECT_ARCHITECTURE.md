@@ -7,6 +7,8 @@ Source of truth for the technical architecture of this project. Written against 
 - [TERRAIN_LAYERS.md](TERRAIN_LAYERS.md) — the Background/Foreground terrain layer referenced in §4/§5/§10 below.
 - [PLAYER_MOVEMENT.md](PLAYER_MOVEMENT.md) — the player's movement/step-up system (§13's "custom, non-physics-engine movement code").
 - [PLAYER_COLLISION.md](PLAYER_COLLISION.md) — the configurable mining-drop collision toggle, an extension of PLAYER_MOVEMENT.md's collision query.
+- [MATERIAL_REACTIONS.md](MATERIAL_REACTIONS.md) — the data-driven Material Reaction System (§4/§7/§8 below).
+- [MATERIALS.md](MATERIALS.md) — the material *content* built on top of the above mechanisms: the DIRT/SAND/STONE/GRAVEL/WATER/LAVA ecosystem, density/displacement, and the WATER+LAVA reaction (§8 below).
 
 ---
 
@@ -16,13 +18,14 @@ PixelSim is a **technical prototype**, not a finished game. It exists to prove o
 
 Concretely, the prototype demonstrates:
 
-- A world made of discrete material cells (AIR, SAND, DIRT, STONE, ores, WATER, WOOD, METAL, GRAVEL) simulated as a grid-based Cellular Automata (CA), not as physics bodies.
-- Falling/settling powders (SAND, GRAVEL) and spreading liquid (WATER).
+- A world made of discrete material cells (AIR, SAND, DIRT, STONE, ores, WATER, WOOD, METAL, GRAVEL, MUD, LAVA) simulated as a grid-based Cellular Automata (CA), not as physics bodies.
+- Falling/settling powders (SAND, GRAVEL) and spreading liquids (WATER, LAVA), plus density-based physical displacement between them (e.g. SAND/GRAVEL sinking through WATER) — see [MATERIALS.md](MATERIALS.md).
 - A player that can move, jump, mine terrain, place blocks, and auto-climb small ledges (PLAYER_MOVEMENT.md), all of which read/write the same simulation grid.
 - Mining that can convert one material into another (DIRT → SAND, STONE → GRAVEL) as a real, physically-simulated cell drop, not a visual effect — including a configurable, batch-quantity conversion ratio (e.g. only half of what's mined drops) rather than a flat 1:1 conversion (see [§9](#9-mining-system)).
 - A cross-chunk activation/wake system so a change in one chunk correctly wakes physically-affected, currently-sleeping material sitting in a *different* chunk (e.g. a mined-out support column revealing unsupported SAND above it) — see [SIMULATION_ACTIVATION.md](SIMULATION_ACTIVATION.md).
 - A static Background terrain layer, separate from the simulated Foreground, revealed wherever the foreground is `AIR` (e.g. mined-out space reads as "inside solid rock" instead of empty void) — see [TERRAIN_LAYERS.md](TERRAIN_LAYERS.md).
 - Configurable player-side toggles for how mining-drop materials are treated: an auto-step-up height limit and a mining-drop collision on/off switch — see [PLAYER_MOVEMENT.md](PLAYER_MOVEMENT.md) / [PLAYER_COLLISION.md](PLAYER_COLLISION.md).
+- A data-driven Material Reaction System, where two adjacent materials can transform into two (possibly different) materials per a declarative table rather than hardcoded per-pair logic — demonstrated today by `WATER + DIRT → AIR + MUD` and `WATER + LAVA → AIR + STONE` — see [MATERIAL_REACTIONS.md](MATERIAL_REACTIONS.md).
 - Chunk-based GPU rendering and chunk-based simulation scheduling (sleep/dirty), so cost scales with *activity*, not world size.
 - A configurable simulation performance budget so the simulation never blocks a frame indefinitely.
 
@@ -85,8 +88,10 @@ pixelsim/                                (repo root)
         │    │    ├── chunk.h            Chunk (fixed 64×64 Cell array + state + background array)
         │    │    ├── material.h/.cpp    MaterialType, MaterialDef table
         │    │    ├── background.h/.cpp  BackgroundType, BackgroundDef table (TERRAIN_LAYERS.md)
+        │    │    ├── reaction.h/.cpp    ReactionDefinition, REACTION_TABLE, find_reaction() (MATERIAL_REACTIONS.md)
         │    │    └── world.h/.cpp       World: chunk grid, step(), mining, activation, background API
-        │    ├── solvers/solvers.{h,cpp} solve_powder, solve_liquid
+        │    ├── solvers/solvers.{h,cpp}          solve_powder, solve_liquid
+        │    ├── solvers/reaction_solver.{h,cpp}  try_react, roll_reaction_probability (MATERIAL_REACTIONS.md)
         │    ├── gen/terrain_gen.{h,cpp} seeded test-terrain generator
         │    ├── sim_world_node.{h,cpp}  Godot Node wrapper (PixelSimWorld)
         │    └── register_types.{h,cpp}  GDExtension entry point
@@ -117,7 +122,8 @@ Game (Godot 4.7.1, gl_compatibility)
            ├── Cell       — 2-byte POD: material id + flags
            ├── Material   — data table of per-material properties (density, behavior, mining rules, color)
            ├── Background — data table of per-cell static "revealed when foreground is AIR" set-dressing (TERRAIN_LAYERS.md)
-           └── Solvers    — solve_powder / solve_liquid (the actual CA rules; Background is never read by these)
+           ├── Reaction   — data table of material-pair transformations, e.g. WATER+DIRT→AIR+MUD (MATERIAL_REACTIONS.md)
+           └── Solvers    — solve_powder / solve_liquid / try_react (the actual CA rules; Background is never read by these)
 ```
 
 - **Why this split:** the simulation core has no idea it's running inside Godot. It is a plain data structure plus plain functions operating on that data structure. Godot only ever sees it through the thin `PixelSimWorld` Node, which translates GDScript calls into core API calls and core results into `Dictionary`/`PackedByteArray`/`Vector2i` Variants. This is what makes the core's standalone C++ test suite possible (see [§2](#2-tech-stack)) and is treated as the most important architectural boundary in the project (see [§11](#11-c--godot-boundary)).
@@ -158,7 +164,7 @@ struct Cell {
 };
 ```
 
-`static_assert(sizeof(Cell) == 2, ...)` enforces this at compile time. It is **not** a Godot `Object`, has no vtable, no reference counting, and no identity beyond its position in a `Chunk`'s array. `flags` currently holds exactly one bit, `FLAG_UPDATED_THIS_STEP`, used to prevent a cell from being moved twice within the same simulation pass (see below).
+`static_assert(sizeof(Cell) == 2, ...)` enforces this at compile time. It is **not** a Godot `Object`, has no vtable, no reference counting, and no identity beyond its position in a `Chunk`'s array. `flags` currently holds two bits (6 still unused): `FLAG_UPDATED_THIS_STEP`, used to prevent a cell from being moved twice within the same simulation pass (see below), and `FLAG_REACTED_THIS_STEP`, the equivalent guard for the Material Reaction System (see [MATERIAL_REACTIONS.md](MATERIAL_REACTIONS.md) "Infinite-Loop / Same-Pass Protection") — both bits are cleared per-chunk at the start of every pass (`Chunk::begin_pass()`).
 
 ### Material
 
@@ -178,6 +184,10 @@ There is no separate "gravity system" — falling *is* the CA rule for `POWDER`/
 ### Sleeping / dirty / touched / active state
 
 See [§6](#6-chunk-system) and [§7](#7-simulation-lifecycle) — these are chunk-system concepts, documented there in full.
+
+### Material reactions
+
+A cell can also *transform* rather than move: `try_react()` (`solvers/reaction_solver.cpp`) checks a POWDER/LIQUID cell's 4 orthogonal neighbors against a small, data-driven `REACTION_TABLE` (`core/reaction.cpp`) and, on a match, rewrites both cells via `set_cell()`. This is checked before movement dispatch in `World::step()`'s per-cell loop (mutually exclusive with movement for that cell this pass) — see [MATERIAL_REACTIONS.md](MATERIAL_REACTIONS.md) for the full model, matching mechanism, and why reaction detection is scoped to POWDER/LIQUID anchors only.
 
 ### Chunk boundary handling
 
@@ -257,6 +267,9 @@ Every Godot frame, main.gd._process(delta):
               for each cell in the row segment:
                 if cell already updated this pass: skip
                 if material behavior is NONE/STATIC: skip
+                try_react() against the cell's 4 orthogonal neighbors
+                  (MATERIAL_REACTIONS.md) - if it fires, this cell's turn is
+                  done (no movement attempt this pass); otherwise:
                 dispatch to solve_powder / solve_liquid
                   → World::can_displace / World::swap_cells
                     → Chunk::mark_touched (wakes + dirties both chunks)
@@ -295,7 +308,7 @@ Two things worth being explicit about because they diverge from a "clean" textbo
 `MaterialType` (`core/material.h`) is a `uint8_t`-backed enum, **append-only by convention** (a comment in the header states this explicitly, because `Cell::material` stores the raw value and any future save format would depend on the ordering):
 
 ```
-AIR, SAND, DIRT, STONE, IRON_ORE, COPPER_ORE, WATER, WOOD, METAL, GRAVEL
+AIR, SAND, DIRT, STONE, IRON_ORE, COPPER_ORE, WATER, WOOD, METAL, GRAVEL, MUD, LAVA
 ```
 
 `MovementBehavior` is a separate, small enum (`NONE`, `STATIC`, `POWDER`, `LIQUID`) that every solver dispatches on — see [§4](#4-simulation-core).
@@ -330,6 +343,12 @@ AIR, SAND, DIRT, STONE, IRON_ORE, COPPER_ORE, WATER, WOOD, METAL, GRAVEL
 | WOOD | STATIC | 0.9 | true | AIR | 1.0 | false |
 | METAL | STATIC | 7.8 | true | AIR | 1.0 | false |
 | GRAVEL | POWDER | 1.9 | **false** | AIR | 1.0 | **true** |
+| MUD | STATIC | 1.6 | true | AIR | 1.0 | false |
+| LAVA | LIQUID | **3.2** | true | AIR | 1.0 | false |
+
+MUD exists only as a product of the Material Reaction System (`WATER + DIRT → AIR + MUD`, see [MATERIAL_REACTIONS.md](MATERIAL_REACTIONS.md)), never placed by terrain generation. It is deliberately `is_mining_drop = false`: that field means "exists only as a **mining**-drop product," a narrower, unrelated concept from "exists only as a **reaction**-drop product" — see MATERIAL_REACTIONS.md for why this is a correct non-match, not a gap.
+
+LAVA is the second `LIQUID` material (see [MATERIALS.md](MATERIALS.md) for the full material-ecosystem writeup) and reuses `solve_liquid()` verbatim — no `solve_lava()` was written. It is distinguished from WATER purely by data: a density (3.2) deliberately higher than every other material in the table (including STONE), so nothing here ever sinks through it, and by being the second reactant in the `WATER + LAVA → AIR + STONE` reaction (MATERIAL_REACTIONS.md). WATER and LAVA never physically displace each other (`material_can_displace` never lets one liquid displace another, regardless of density) — their only interaction is the reaction system.
 
 `can_be_mined` and `mined_drop` are deliberately independent fields — a material can be minable with no drop (`mined_drop == AIR`, i.e. "just clear it"), and the table format allows a drop mapping to exist without that alone implying minability (mining code always checks `can_be_mined` first; nothing infers minability from whether `mined_drop` is set). This is why SAND and GRAVEL — themselves the *product* of mining DIRT/STONE — are not re-minable: it's what prevents an infinite DIRT → SAND → (mine again) → SAND loop.
 
@@ -337,7 +356,7 @@ Ore (`IRON_ORE`/`COPPER_ORE`) is minable but has no drop mapping (`mined_drop = 
 
 `drop_ratio` is applied to a mined *batch's* quantity, never per individual cell — see [§9](#9-mining-system) for the exact algorithm (`World::compute_drop_count`). `is_mining_drop` is unrelated to mining mechanics entirely; it exists only so `player.gd` can classify SAND/GRAVEL as "collision-configurable" without adding per-cell state — see [PLAYER_COLLISION.md](PLAYER_COLLISION.md).
 
-Future materials the table format already supports without further core changes: anything expressible as a name + behavior + density + color + `can_be_mined`/`mined_drop`/`drop_ratio`/`is_mining_drop` set — e.g. `COPPER_ORE → COPPER_ORE_CHUNK`, `ICE → ICE_CHUNK`. Anything needing a genuinely new *movement rule* (FIRE spreading, GAS rising, temperature/pressure) would need a new `MovementBehavior` case and solver, not just a table row — that is future/unimplemented work (see [§17](#17-future-directions)).
+Future materials the table format already supports without further core changes: anything expressible as a name + behavior + density + color + `can_be_mined`/`mined_drop`/`drop_ratio`/`is_mining_drop` set — e.g. `COPPER_ORE → COPPER_ORE_CHUNK`, `ICE → ICE_CHUNK`. LAVA is a real, shipped example of exactly this: a second `LIQUID` material added as pure data (see above), no core changes required. Anything needing a genuinely new *movement rule* (FIRE spreading, GAS rising, temperature/pressure) would need a new `MovementBehavior` case and solver, not just a table row — that is future/unimplemented work (see [§17](#17-future-directions)).
 
 ---
 
@@ -431,6 +450,8 @@ Verified by the fact that `tests/test_core.cpp` compiles and links these files d
 
 ### Stress test results (measured)
 
+The stress-test harness (`stress_test.gd`) only spawns SAND — see [MATERIALS.md "Performance"](MATERIALS.md#performance) for an equivalent-methodology comparison (standalone `World` API, not the GDScript harness) of the pre-existing SAND-only baseline against the new WATER/LAVA-inclusive ecosystem, confirming active-chunk count still tracks the reactive/liquid region's size, not the world total, and that adding a WATER pool to a 250k-SAND scenario costs roughly the same order of magnitude as SAND alone (~+5.6% avg sim time).
+
 Using the built-in harness (`Shift+1..5` in `stress_test.gd`), default world (48×28 chunks, 5,505,024 total cells), `simulation_budget_ms = 4.0`:
 
 | SAND cells spawned | avg FPS | min FPS | avg sim ms | max sim ms | active chunks (of 1344) |
@@ -474,6 +495,7 @@ Things that hold true throughout the current codebase and should not change with
 - The player does not exist as simulation cells and is not part of the `World` grid; it is a separate Godot node with its own (currently fully custom, non-physics-engine) movement code that *reads* the grid for collision.
 - Activation propagation (waking a neighboring chunk on suspicion) is O(1)/fixed-size per world change and is never a full-world or unconditional-large-radius wake — see [SIMULATION_ACTIVATION.md](SIMULATION_ACTIVATION.md) for the complete, binding invariant list.
 - The Background layer is static and never participates in the CA simulation, is never written by simulation code, and a write to it never wakes a chunk — see [TERRAIN_LAYERS.md](TERRAIN_LAYERS.md) for the complete, binding invariant list.
+- Material reactions are table-driven (`ReactionDefinition`/`REACTION_TABLE`), never per-pair `if`/`switch` logic; a reaction is defined once and matches both `A+B` and `B+A`; reaction execution writes exclusively through `set_cell()` (so it inherits activation/wake for free, with no reaction-specific wake path); the Background layer is structurally unreachable from reaction code — see [MATERIAL_REACTIONS.md](MATERIAL_REACTIONS.md) for the complete, binding invariant list.
 - `Cell` growth is avoided even for features that conceptually add "per-cell" data (the Background layer, mining-drop collision classification) by pushing that data to `Chunk`-level or `MaterialDef`-level (per-type) storage instead — see [§14](#14-do-not-change-without-an-explicit-architectural-decision).
 
 ---
@@ -508,7 +530,7 @@ Things that hold true throughout the current codebase and should not change with
 **WHY:** This specific combination is what makes the Windows/MSVC build succeed at all against Godot 4.7.1 today; see [§2.1](#21-version-coupling-that-must-not-be-casually-changed).
 **WHEN CAN IT CHANGE:** If godot-cpp is upgraded to a version with native 4.7.x support and without the MSVC macro-collision issue, this combination can be simplified — but that must be a deliberate re-validation (rebuild, rerun both test suites, re-verify in the editor), not a silent `git pull` inside `godot-cpp/`.
 
-**See also** — each companion document has its own, more detailed "DO NOT CHANGE WITHOUT AN EXPLICIT ARCHITECTURAL DECISION" section for the feature it covers, not duplicated here: [SIMULATION_ACTIVATION.md](SIMULATION_ACTIVATION.md#do-not-change-without-an-explicit-architectural-decision) (activation neighborhood, no full-world wake), [TERRAIN_LAYERS.md](TERRAIN_LAYERS.md#do-not-change-without-an-explicit-architectural-decision) (Background stays static/non-simulated, `Cell` stays unchanged), [PLAYER_COLLISION.md](PLAYER_COLLISION.md#do-not-change-without-an-explicit-architectural-decision) (mining-drop collision classification is per-type, never per-cell).
+**See also** — each companion document has its own, more detailed "DO NOT CHANGE WITHOUT AN EXPLICIT ARCHITECTURAL DECISION" section for the feature it covers, not duplicated here: [SIMULATION_ACTIVATION.md](SIMULATION_ACTIVATION.md#do-not-change-without-an-explicit-architectural-decision) (activation neighborhood, no full-world wake), [TERRAIN_LAYERS.md](TERRAIN_LAYERS.md#do-not-change-without-an-explicit-architectural-decision) (Background stays static/non-simulated, `Cell` stays unchanged), [PLAYER_COLLISION.md](PLAYER_COLLISION.md#do-not-change-without-an-explicit-architectural-decision) (mining-drop collision classification is per-type, never per-cell), [MATERIAL_REACTIONS.md](MATERIAL_REACTIONS.md#do-not-change-without-an-explicit-architectural-decision) (reactions stay table-driven, no reaction-specific wake path, no second reaction-detection scan).
 
 ---
 
@@ -537,6 +559,8 @@ Things that hold true throughout the current codebase and should not change with
 | Mining-drop conversion ratio | `MaterialDef.drop_ratio` applied to a mined *batch's* quantity via `World::compute_drop_count` (floor + persistent per-material remainder), not rounded per individual mined cell | Explicit requirement that repeated small mining actions total the same drop count as one big one, and that fractional ratios (e.g. 0.5) behave deterministically |
 | Player step-up | Custom, GDScript-only lift-and-retry inside the existing per-pixel horizontal collision loop; height configured in simulation cells (`player_step_height_cells`), converted to pixels only at point of use | Keeps the feature's meaning stable under a reconfigured `simulation_cell_size`, and reuses (rather than duplicates) the existing `_rect_blocked` collision primitive — see [PLAYER_MOVEMENT.md](PLAYER_MOVEMENT.md) |
 | Mining-drop collision classification | `MaterialDef.is_mining_drop`, a per-material-type flag (not per-cell), consumed only by `player.gd`'s collision query, never by the simulation core | SAND/GRAVEL are, in the current game content, exclusively mining-drop products (never placed by generation/building), so type-level classification is exact today; see [PLAYER_COLLISION.md](PLAYER_COLLISION.md) for what would have to change if that stops being true |
+| Material Reaction System | `ReactionDefinition`/`REACTION_TABLE` (data) + `try_react()` (`solvers/reaction_solver.cpp`), piggybacked on `World::step()`'s existing per-cell loop for POWDER/LIQUID cells; one new `Cell::flags` bit (`FLAG_REACTED_THIS_STEP`) bounds a cell to at most one reaction per pass | Reuses the existing pass/scan/activation machinery instead of a new lifecycle; first demo reaction is `WATER + DIRT → AIR + MUD` (not the originally-suggested `WATER + LAVA → STONE`, since `LAVA` doesn't exist; an earlier `WATER + STONE` draft was rejected after it broke `STONE`'s pervasive role as the codebase's inert floor/wall material) — see [MATERIAL_REACTIONS.md](MATERIAL_REACTIONS.md) |
+| Material ecosystem (LAVA) | LAVA added as a second `MovementBehavior::LIQUID` material row (density 3.2, deliberately higher than everything else including STONE), reusing `solve_liquid()` verbatim; paired with one new `REACTION_TABLE` row, `WATER + LAVA → AIR + STONE` | Fulfills the reaction system's originally-deferred demo reaction now that LAVA exists, without any new solver/lifecycle/collision code; LAVA's density was chosen so no POWDER material sinks through it (a deliberate gameplay property, not real-world physics) — see [MATERIALS.md](MATERIALS.md) |
 
 ---
 
@@ -554,6 +578,7 @@ These are observed, real limitations of the current state — documenting them i
 - **Stress test methodology caveat:** the recorded 10k–500k results ([§12](#12-performance-architecture)) were run cumulatively without resetting the world between tiers, and the spawn shape (a wide, mostly-full-width slab) means higher tiers aren't a clean apples-to-apples scaling comparison — useful as a stability/ballpark signal, not as a rigorous scaling curve.
 - **Determinism is plausible but not formally verified** across different `simulation_budget_ms` values or across engine/platform versions — only reasoned about from the code structure ([§4](#4-simulation-core)).
 - **Only Windows/MSVC has actually been built and tested.** The `.gdextension` file declares Linux and macOS library paths, but neither has been built or verified.
+- **Reaction detection only covers POWDER/LIQUID anchors.** A reaction between two `STATIC` materials would never be detected by the current mechanism (it piggybacks on cells `World::step()` already visits for movement) — see [MATERIAL_REACTIONS.md](MATERIAL_REACTIONS.md) "Simulation Integration". Not needed by the one reaction implemented today; a deliberate scope boundary, not an oversight.
 
 ---
 
@@ -566,7 +591,7 @@ These are observed, real limitations of the current state — documenting them i
 - Multi-threaded chunk stepping, using the existing chunk-granular sleep/dirty model as the unit of parallel work.
 - SIMD-optimized solver inner loops.
 - Streaming/lazy chunk allocation for worlds larger than a single preallocated block (a real hash-map-or-similar chunk store instead of a flat preallocated array).
-- Additional materials requiring new `MovementBehavior` kinds: FIRE, OIL, LAVA, GAS, ACID, SMOKE, STEAM, temperature/pressure simulation.
+- Additional materials requiring new `MovementBehavior` kinds: FIRE, OIL, GAS, ACID, SMOKE, STEAM, temperature/pressure simulation. (LAVA no longer belongs on this list — it shipped as a second `LIQUID` material requiring no new `MovementBehavior`; see [§8](#8-material-system) / [MATERIALS.md](MATERIALS.md).)
 - Building/automation-layer systems (conveyors, machines, storage, power) explicitly deferred by the original project brief.
 - A `template_release` export build and cross-platform (Linux/macOS) verification.
 

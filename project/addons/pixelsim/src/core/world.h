@@ -12,6 +12,8 @@ struct StepStats {
     bool pass_completed = false; // did this call finish a full bottom-to-top pass?
     uint64_t cells_evaluated = 0;
     uint64_t cells_moved = 0;
+    uint64_t reaction_checks = 0;    // try_react() invocations (see MATERIAL_REACTIONS.md)
+    uint64_t reactions_executed = 0; // of which actually fired a reaction
     int active_chunks = 0;   // not sleeping
     int sleeping_chunks = 0;
     int total_chunks = 0;
@@ -76,6 +78,12 @@ public:
 
     bool is_cell_updated_this_step(int x, int y) const;
     void mark_cell_updated(int x, int y);
+
+    // See MATERIAL_REACTIONS.md "Infinite-Loop / Same-Pass Protection" - a
+    // cell may react at most once per pass. Cleared per-chunk in
+    // Chunk::begin_pass(), alongside is_cell_updated_this_step's flag.
+    bool is_cell_reacted_this_step(int x, int y) const;
+    void mark_cell_reacted(int x, int y);
 
     // Activation propagation for a world change at (x,y) - see
     // SIMULATION_ACTIVATION.md. Wakes (Chunk::wake(), not mark_touched()) the

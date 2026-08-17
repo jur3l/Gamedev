@@ -1,8 +1,9 @@
 extends Node
 ## Left mouse = mine (configurable-shape/size area removal -> AIR/mined_drop,
 ## ore -> resource counter). Right mouse = build (single cell, grid-snapped
-## placement of WOOD/METAL). Purely reads/writes the simulation grid through
-## PixelSimWorld - no physics bodies are created for mined or placed material.
+## placement of WOOD/METAL/WATER/LAVA). Purely reads/writes the simulation
+## grid through PixelSimWorld - no physics bodies are created for mined or
+## placed material.
 
 const DEFAULT_MINING_SIZE := 8
 const MIN_MINING_SIZE := 1
@@ -53,6 +54,10 @@ func _unhandled_input(event: InputEvent) -> void:
 			build_material = sim_world.MATERIAL_WOOD
 		elif event.keycode == KEY_2:
 			build_material = sim_world.MATERIAL_METAL
+		elif event.keycode == KEY_3:
+			build_material = sim_world.MATERIAL_WATER
+		elif event.keycode == KEY_4:
+			build_material = sim_world.MATERIAL_LAVA
 
 func _process(_delta: float) -> void:
 	if Input.is_action_just_pressed("mining_size_increase"):
