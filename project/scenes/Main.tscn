@@ -1,0 +1,48 @@
+[gd_scene format=3 uid="uid://cq0v0r1sim001"]
+
+[ext_resource type="Script" uid="uid://cel3bg4mqwgn4" path="res://scripts/main.gd" id="1"]
+[ext_resource type="Script" uid="uid://cf6btu77y5n8j" path="res://scripts/chunk_renderer.gd" id="2"]
+[ext_resource type="Script" uid="uid://7bgtpjep23dm" path="res://scripts/player.gd" id="3"]
+[ext_resource type="Script" uid="uid://upld5t53dusb" path="res://scripts/mining_building.gd" id="4"]
+[ext_resource type="Script" uid="uid://bxf10mhj2t8ky" path="res://scripts/particles.gd" id="5"]
+[ext_resource type="Script" uid="uid://brnwwtcvg4vev" path="res://scripts/debug_overlay.gd" id="6"]
+[ext_resource type="Script" uid="uid://t4atp7ia7gqs" path="res://scripts/stress_test.gd" id="7"]
+
+[node name="Main" type="Node2D" unique_id=253445235]
+script = ExtResource("1")
+
+[node name="PixelSimWorld" type="PixelSimWorld" parent="." unique_id=1223638757]
+
+[node name="ChunkRenderer" type="Node2D" parent="." unique_id=1740628808]
+script = ExtResource("2")
+sim_world_path = NodePath("../PixelSimWorld")
+
+[node name="Player" type="CharacterBody2D" parent="." unique_id=369227821]
+script = ExtResource("3")
+sim_world_path = NodePath("../PixelSimWorld")
+
+[node name="Camera2D" type="Camera2D" parent="Player" unique_id=984818198]
+zoom = Vector2(2, 2)
+position_smoothing_enabled = true
+position_smoothing_speed = 8.0
+
+[node name="Particles" type="Node2D" parent="." unique_id=1696422368]
+script = ExtResource("5")
+
+[node name="MiningBuilding" type="Node" parent="." unique_id=915438419]
+script = ExtResource("4")
+sim_world_path = NodePath("../PixelSimWorld")
+camera_path = NodePath("../Player/Camera2D")
+main_path = NodePath("..")
+particles_path = NodePath("../Particles")
+
+[node name="StressTest" type="Node" parent="." unique_id=1024644898]
+script = ExtResource("7")
+sim_world_path = NodePath("../PixelSimWorld")
+
+[node name="DebugOverlay" type="CanvasLayer" parent="." unique_id=1782498673]
+script = ExtResource("6")
+sim_world_path = NodePath("../PixelSimWorld")
+main_path = NodePath("..")
+chunk_renderer_path = NodePath("../ChunkRenderer")
+mining_building_path = NodePath("../MiningBuilding")

@@ -1,0 +1,33 @@
+# Godot editor cache - local, auto-regenerated on first project open.
+.godot/
+
+# Vendored godot-cpp bindings (~300MB third-party clone). Not re-committed -
+# see PROJECT_ARCHITECTURE.md §2.1 for the exact clone/patch steps needed to
+# reproduce it (branch 4.4 + the local binding_generator.py MSVC patch).
+project/addons/pixelsim/godot-cpp/
+
+# Compiled GDExtension output - rebuild via SConstruct (see PROJECT_ARCHITECTURE.md §2).
+project/addons/pixelsim/bin/
+
+# Standalone test build artifacts (tests/test_core.cpp is the real source; these are its build output).
+project/addons/pixelsim/tests/*.obj
+project/addons/pixelsim/tests/*.obj.import
+project/addons/pixelsim/tests/*.exe
+
+# GDExtension build byproducts that land next to the source when compiled
+# (SCons default object-file location) - not source, regenerate via SConstruct.
+project/addons/pixelsim/src/**/*.obj
+project/addons/pixelsim/src/**/*.obj.import
+project/addons/pixelsim/.sconsign.dblite
+
+# The user's own running log of prompts for this session - personal working
+# notes, not project source; excluded by default rather than assumed public.
+PAST_POMPTS.md
+
+# Third-party dev-only MCP editor tooling used during development - not part
+# of the PixelSim architecture (see PROJECT_ARCHITECTURE.md §2).
+project/addons/godot_mcp/
+
+# OS cruft
+Thumbs.db
+.DS_Store
