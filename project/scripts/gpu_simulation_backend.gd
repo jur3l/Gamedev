@@ -252,6 +252,53 @@ func run_ticks_active_region(count: int) -> Dictionary:
 		"region_rect": region_rect,
 	}
 
+## GPU Production Bridge (SIMULATION_TIMESCALE.md "GPU Production Wiring"):
+## identical accumulator shape to advance() above, but drives
+## run_ticks_active_region() instead of gpu.step() (full-world) - for a
+## caller that wants fixed-timestep pacing together with Phase 2D's
+## bounded-region dispatch. Reuses the SAME accumulator/tick_counter/backlog
+## fields advance() uses, so metrics stay unified regardless of which
+## dispatch mode produced them. Never call this and advance()/
+## run_ticks_unpaced() on the same backend instance in the same run - both
+## would fight over one accumulator. Caller must have already called
+## enable_active_region()/wake_region() at least once (this method never
+## does so itself - see GPUProductionBridge).
+func advance_active_region(real_delta: float) -> Dictionary:
+	var t_start := Time.get_ticks_usec()
+	accumulator += real_delta
+
+	var ticks_this_frame := 0
+	while accumulator >= fixed_dt and ticks_this_frame < max_ticks_per_frame:
+		accumulator -= fixed_dt
+		ticks_this_frame += 1
+
+	# run_ticks_active_region() already updates tick_counter/ticks_executed/
+	# simulation_time/total_compute_usec internally (same contract as when
+	# called directly) - not duplicated here.
+	var region_result := {}
+	if ticks_this_frame > 0:
+		region_result = run_ticks_active_region(ticks_this_frame)
+
+	backlog_ticks = int(floor(accumulator / fixed_dt))
+	if backlog_ticks > max_backlog_ticks_seen:
+		max_backlog_ticks_seen = backlog_ticks
+	_backlog_sample_sum += backlog_ticks
+	_backlog_sample_count += 1
+
+	var compute_usec: int = region_result.get("compute_usec", 0)
+	var t_total := Time.get_ticks_usec() - t_start
+	var orchestration_usec := t_total - compute_usec
+	total_orchestration_usec += orchestration_usec
+
+	return {
+		"ticks_this_frame": ticks_this_frame,
+		"backlog_ticks": backlog_ticks,
+		"compute_usec": compute_usec,
+		"orchestration_usec": orchestration_usec,
+		"dispatched": region_result.get("dispatched", false),
+		"region_active": region_result.get("region_active", region_active),
+	}
+
 func region_chunk_count() -> int:
 	if not region_active:
 		return 0

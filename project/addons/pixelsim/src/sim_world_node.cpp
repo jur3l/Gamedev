@@ -69,6 +69,11 @@ void PixelSimWorld::_bind_methods() {
     ClassDB::bind_method(D_METHOD("mine_area", "x", "y", "size", "shape"), &PixelSimWorld::mine_area);
     ClassDB::bind_method(D_METHOD("fill_rect", "x", "y", "w", "h", "material"), &PixelSimWorld::fill_rect);
 
+    ClassDB::bind_method(D_METHOD("get_materials_rect", "x", "y", "w", "h"), &PixelSimWorld::get_materials_rect);
+    ClassDB::bind_method(D_METHOD("set_materials_rect", "x", "y", "w", "h", "materials"), &PixelSimWorld::set_materials_rect);
+    ClassDB::bind_method(D_METHOD("set_movement_externally_owned", "material", "owned"), &PixelSimWorld::set_movement_externally_owned);
+    ClassDB::bind_method(D_METHOD("is_movement_externally_owned", "material"), &PixelSimWorld::is_movement_externally_owned);
+
     ClassDB::bind_method(D_METHOD("get_background", "x", "y"), &PixelSimWorld::get_background);
     ClassDB::bind_method(D_METHOD("get_background_name", "background"), &PixelSimWorld::get_background_name);
     ClassDB::bind_method(D_METHOD("set_background", "x", "y", "background"), &PixelSimWorld::set_background);
@@ -197,6 +202,39 @@ Dictionary PixelSimWorld::mine_area(int x, int y, int size, int shape) {
 void PixelSimWorld::fill_rect(int x, int y, int w, int h, int material) {
     if (!world_) return;
     world_->fill_rect(x, y, w, h, static_cast<MaterialType>(material));
+}
+
+PackedByteArray PixelSimWorld::get_materials_rect(int x, int y, int w, int h) {
+    PackedByteArray bytes;
+    if (!world_ || w <= 0 || h <= 0) return bytes;
+    std::vector<MaterialType> materials = world_->get_materials_rect(x, y, w, h);
+    bytes.resize(materials.size());
+    uint8_t *out = bytes.ptrw();
+    for (size_t i = 0; i < materials.size(); ++i) {
+        out[i] = static_cast<uint8_t>(materials[i]);
+    }
+    return bytes;
+}
+
+int PixelSimWorld::set_materials_rect(int x, int y, int w, int h, PackedByteArray materials) {
+    if (!world_ || w <= 0 || h <= 0) return 0;
+    std::vector<MaterialType> converted;
+    converted.reserve(static_cast<size_t>(materials.size()));
+    const uint8_t *in = materials.ptr();
+    for (int i = 0; i < materials.size(); ++i) {
+        converted.push_back(static_cast<MaterialType>(in[i]));
+    }
+    return world_->set_materials_rect(x, y, w, h, converted);
+}
+
+void PixelSimWorld::set_movement_externally_owned(int material, bool owned) {
+    if (!world_) return;
+    world_->set_movement_externally_owned(static_cast<MaterialType>(material), owned);
+}
+
+bool PixelSimWorld::is_movement_externally_owned(int material) const {
+    if (!world_) return false;
+    return world_->is_movement_externally_owned(static_cast<MaterialType>(material));
 }
 
 int PixelSimWorld::get_background(int x, int y) {

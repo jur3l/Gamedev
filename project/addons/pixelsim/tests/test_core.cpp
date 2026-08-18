@@ -1404,6 +1404,98 @@ static void test_mining_regression_with_lava_present() {
     CHECK(count_material_in_rect(world, 2, 10, 10, 1, MaterialType::GRAVEL) == 5);
 }
 
+// --- GPU production bridge support: bulk material-rect I/O + the
+// movement-dispatch externally-owned gate (core/world.h). See
+// SIMULATION_TIMESCALE.md "GPU Production Wiring". ---
+
+static void test_materials_rect_round_trip() {
+    std::printf("test_materials_rect_round_trip\n");
+    World world(1, 1, 501);
+    world.set_cell(2, 2, MaterialType::SAND);
+    world.set_cell(3, 2, MaterialType::WATER);
+    world.set_cell(4, 2, MaterialType::STONE);
+    std::vector<MaterialType> read = world.get_materials_rect(2, 2, 3, 1);
+    CHECK(read.size() == 3);
+    CHECK(read[0] == MaterialType::SAND);
+    CHECK(read[1] == MaterialType::WATER);
+    CHECK(read[2] == MaterialType::STONE);
+
+    std::vector<MaterialType> written = {MaterialType::AIR, MaterialType::LAVA, MaterialType::STONE};
+    int changed = world.set_materials_rect(2, 2, 3, 1, written);
+    CHECK(changed == 2); // SAND->AIR and WATER->LAVA changed; STONE->STONE is a no-op
+    CHECK(world.get_material(2, 2) == MaterialType::AIR);
+    CHECK(world.get_material(3, 2) == MaterialType::LAVA);
+    CHECK(world.get_material(4, 2) == MaterialType::STONE);
+}
+
+static void test_materials_rect_write_wakes_only_actually_changed_cells() {
+    std::printf("test_materials_rect_write_wakes_only_actually_changed_cells\n");
+    World world(1, 1, 502);
+    run_full_pass(world);
+    CHECK(count_active_chunks(world) == 0);
+
+    std::vector<MaterialType> unchanged = {MaterialType::AIR, MaterialType::AIR};
+    int changed = world.set_materials_rect(10, 10, 2, 1, unchanged);
+    CHECK(changed == 0);
+    CHECK(count_active_chunks(world) == 0); // a true no-op write must not wake anything
+
+    std::vector<MaterialType> one_change = {MaterialType::SAND, MaterialType::AIR};
+    changed = world.set_materials_rect(10, 10, 2, 1, one_change);
+    CHECK(changed == 1);
+    CHECK(count_active_chunks(world) == 1); // the actual change wakes its chunk, via set_cell()
+}
+
+static void test_movement_gate_defaults_to_false_for_every_material() {
+    std::printf("test_movement_gate_defaults_to_false_for_every_material\n");
+    World world(1, 1, 503);
+    for (int i = 0; i < MATERIAL_COUNT; ++i) {
+        CHECK(world.is_movement_externally_owned(static_cast<MaterialType>(i)) == false);
+    }
+}
+
+static void test_movement_gate_suppresses_powder_movement() {
+    std::printf("test_movement_gate_suppresses_powder_movement\n");
+    World world(1, 1, 504);
+    world.set_cell(5, 5, MaterialType::SAND);
+    world.set_movement_externally_owned(MaterialType::SAND, true);
+    CHECK(world.is_movement_externally_owned(MaterialType::SAND) == true);
+    run_full_pass(world);
+    CHECK(world.get_material(5, 5) == MaterialType::SAND); // never attempted to move
+    CHECK(world.get_material(5, 6) == MaterialType::AIR);
+
+    world.set_movement_externally_owned(MaterialType::SAND, false);
+    run_full_pass(world);
+    CHECK(world.get_material(5, 5) == MaterialType::AIR); // moves normally again once ungated
+    CHECK(world.get_material(5, 6) == MaterialType::SAND);
+}
+
+static void test_movement_gate_suppresses_liquid_movement() {
+    std::printf("test_movement_gate_suppresses_liquid_movement\n");
+    World world(1, 1, 505);
+    world.set_cell(5, 5, MaterialType::WATER);
+    world.set_movement_externally_owned(MaterialType::WATER, true);
+    run_full_pass(world);
+    CHECK(world.get_material(5, 5) == MaterialType::WATER);
+    CHECK(world.get_material(5, 6) == MaterialType::AIR);
+    world.set_movement_externally_owned(MaterialType::WATER, false);
+}
+
+// The gate must ONLY suppress the movement dispatch (world.cpp's
+// solve_powder/solve_liquid call site) - reactions are a separate,
+// unconditional call earlier in step()'s per-cell logic and must keep
+// firing normally for a movement-gated material.
+static void test_movement_gate_does_not_suppress_reactions() {
+    std::printf("test_movement_gate_does_not_suppress_reactions\n");
+    World world(1, 1, 506);
+    world.set_cell(5, 5, MaterialType::WATER);
+    world.set_cell(6, 5, MaterialType::LAVA);
+    world.set_movement_externally_owned(MaterialType::WATER, true);
+    run_full_pass(world);
+    CHECK(world.get_material(5, 5) == MaterialType::AIR);   // WATER+LAVA reaction still fires
+    CHECK(world.get_material(6, 5) == MaterialType::STONE);
+    world.set_movement_externally_owned(MaterialType::WATER, false);
+}
+
 int main() {
     test_sand_falls();
     test_sand_blocked_by_stone();
@@ -1487,6 +1579,13 @@ int main() {
     test_lava_sleep_wake();
     test_material_is_reaction_capable();
     test_mining_regression_with_lava_present();
+
+    test_materials_rect_round_trip();
+    test_materials_rect_write_wakes_only_actually_changed_cells();
+    test_movement_gate_defaults_to_false_for_every_material();
+    test_movement_gate_suppresses_powder_movement();
+    test_movement_gate_suppresses_liquid_movement();
+    test_movement_gate_does_not_suppress_reactions();
 
     std::printf("\n%d/%d checks passed\n", g_checks - g_failures, g_checks);
     if (g_failures > 0) {

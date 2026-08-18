@@ -90,6 +90,19 @@ public:
     Dictionary mine_area(int x, int y, int size, int shape);
     void fill_rect(int x, int y, int w, int h, int material);
 
+    // --- Bulk material-id rect I/O (GPU production bridge) - one byte per
+    // cell, raw MaterialType ids, NOT the RGBA8 rendering bytes
+    // get_chunk_pixels_rect() returns. See core/world.h's
+    // get_materials_rect()/set_materials_rect() for the exact contract. ---
+    PackedByteArray get_materials_rect(int x, int y, int w, int h);
+    int set_materials_rect(int x, int y, int w, int h, PackedByteArray materials);
+
+    // Movement-dispatch gate - see core/world.h's
+    // set_movement_externally_owned(). Defaults to false for every
+    // material; only the GPU production bridge is expected to call this.
+    void set_movement_externally_owned(int material, bool owned);
+    bool is_movement_externally_owned(int material) const;
+
     // --- Background layer (see TERRAIN_LAYERS.md) - static, non-simulated,
     // shown wherever the foreground cell is AIR. set_background() never
     // wakes a chunk or touches simulation state, unlike set_cell(). ---

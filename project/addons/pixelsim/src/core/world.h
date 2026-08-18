@@ -144,6 +144,29 @@ public:
     // terrain generation and the stress-test harness.
     void fill_rect(int x0, int y0, int w, int h, MaterialType material);
 
+    // Bulk material-id rect I/O (GPU production bridge - see
+    // SIMULATION_TIMESCALE.md "GPU Production Wiring"). Read is a plain
+    // per-cell get_material() loop (no side effects). Write goes through
+    // set_cell() for every cell that actually differs from its current
+    // value - reuses set_cell()'s existing wake/dirty/touched-rect/
+    // activate_affected_neighbors() bookkeeping "for free", and a no-op
+    // write (materials[i] == current value) costs a single comparison, no
+    // wake/dirty churn. Returns the number of cells actually changed.
+    // Out-of-bounds sub-rects are clamped to the world, never asserted.
+    std::vector<MaterialType> get_materials_rect(int x0, int y0, int w, int h) const;
+    int set_materials_rect(int x0, int y0, int w, int h, const std::vector<MaterialType> &materials);
+
+    // Movement-dispatch gate (GPU production bridge): when true for a
+    // material, World::step() still runs reactions for that material
+    // normally, but skips solve_powder()/solve_liquid() for it entirely -
+    // see the call site in step(). Defaults to false for every material, so
+    // this has zero effect on behavior unless a caller explicitly opts a
+    // material in. Intended for exactly one external owner at a time (the
+    // GPU bridge) - this is a simple boolean gate, not a general-purpose
+    // ownership/locking mechanism.
+    void set_movement_externally_owned(MaterialType material, bool owned);
+    bool is_movement_externally_owned(MaterialType material) const;
+
     // Simple deterministic xorshift32 RNG shared by all solvers so that a
     // fixed world seed reproduces a fixed simulation history.
     uint32_t rand_u32();
@@ -180,6 +203,7 @@ private:
     uint32_t current_pass_id_ = 1;
     int resume_y_ = -1; // -1 == start a fresh pass at the top of the next step() call
     float mining_remainder_[MATERIAL_COUNT] = {}; // per-material fractional carry, see compute_drop_count()
+    bool externally_owned_movement_[MATERIAL_COUNT] = {}; // see set_movement_externally_owned()
 
     void ensure_chunk_begun(Chunk &chunk);
     void finish_pass();

@@ -39,6 +39,27 @@ const MAT_WATER := 3
 const MAT_REACT_TEST_A := 4
 const MAT_REACT_TEST_B := 5
 
+# GPU Production Bridge (SIMULATION_TIMESCALE.md "GPU Production Wiring") -
+# the remaining CPU MaterialType values (core/material.h), given GPU ids so
+# the production bridge's synced buffer can represent the WHOLE world, not
+# just SAND/STONE/WATER. Per the shader's is_movable()/can_displace()
+# (gpu_cellular_solver.glsl), any material id that isn't specifically
+# special-cased there is automatically treated as an immovable,
+# non-displaceable obstacle - so these need ZERO shader changes to behave
+# correctly as terrain for SAND/WATER to rest on/be blocked by. None of
+# these are ever moved BY the GPU (the bridge never enables their movement
+# gate on the CPU side either) - CPU keeps fully owning GRAVEL/LAVA movement
+# and the Material Reaction System, unchanged; these ids exist here purely
+# so GPU-side SAND/WATER see correct obstacles.
+const MAT_DIRT := 6
+const MAT_IRON_ORE := 7
+const MAT_COPPER_ORE := 8
+const MAT_WOOD := 9
+const MAT_METAL := 10
+const MAT_GRAVEL := 11
+const MAT_MUD := 12
+const MAT_LAVA := 13
+
 # Phase 2E - dense reaction-rule table dimension, must match the shader's
 # own MAX_MATERIALS constant exactly.
 const MAX_MATERIALS := 16
@@ -285,6 +306,42 @@ func read_bounds() -> Dictionary:
 		"max_x": max_x,
 		"max_y": max_y,
 	}
+
+## GPU Production Bridge: partial write into the CURRENT (latest) buffer for
+## a sub-rectangle [x, x+w) x [y, y+h) - unlike setup_grid() (allocates a
+## brand-new buffer pair) this mutates the existing simulation in place, so
+## a caller can keep ticking the same buffers while only re-syncing a
+## bounded region each call. Each row of the rect is one contiguous span in
+## the flat row-major buffer, so this is one buffer_update() call per row,
+## not per cell.
+func write_rect(x: int, y: int, w: int, h: int, materials: PackedInt32Array) -> void:
+	if not available or w <= 0 or h <= 0:
+		return
+	if materials.size() != w * h:
+		push_error("GPUSandPoC.write_rect: materials size mismatch")
+		return
+	var buf := _buf_a if _current_is_a else _buf_b
+	for row in range(h):
+		var row_bytes := _int32_array_to_bytes(materials.slice(row * w, (row + 1) * w))
+		var offset := ((y + row) * width + x) * 4
+		_rd.buffer_update(buf, offset, row_bytes.size(), row_bytes)
+
+## GPU Production Bridge: partial read of the CURRENT (latest) buffer for a
+## sub-rectangle - the read counterpart to write_rect(), same one-
+## buffer_get_data()-call-per-row shape. Distinct from read_back() (whole
+## buffer) - use this when only a bounded active region needs syncing back.
+func read_rect(x: int, y: int, w: int, h: int) -> PackedInt32Array:
+	var out := PackedInt32Array()
+	if not available or w <= 0 or h <= 0:
+		return out
+	out.resize(w * h)
+	var buf := _buf_a if _current_is_a else _buf_b
+	for row in range(h):
+		var offset := ((y + row) * width + x) * 4
+		var row_ints := _bytes_to_int32_array(_rd.buffer_get_data(buf, offset, w * 4))
+		for i in range(w):
+			out[row * w + i] = row_ints[i]
+	return out
 
 ## Reads back the current (latest) buffer as a flat PackedInt32Array.
 ## Measured separately from step() - see the request's "GPU compute time

@@ -1,4 +1,5 @@
 #include "world.h"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <utility>
@@ -220,7 +221,7 @@ StepStats World::step(double simulation_budget_ms) {
                 }
 
                 bool moved = false;
-                if (!reacted) {
+                if (!reacted && !externally_owned_movement_[static_cast<int>(mat)]) {
                     if (def.behavior == MovementBehavior::POWDER) {
                         moved = solve_powder(*this, world_x, y);
                     } else if (def.behavior == MovementBehavior::LIQUID) {
@@ -347,6 +348,45 @@ void World::fill_rect(int x0, int y0, int w, int h, MaterialType material) {
             set_cell(x, y, material);
         }
     }
+}
+
+std::vector<MaterialType> World::get_materials_rect(int x0, int y0, int w, int h) const {
+    std::vector<MaterialType> out;
+    out.reserve(static_cast<size_t>(std::max(w, 0)) * static_cast<size_t>(std::max(h, 0)));
+    for (int y = y0; y < y0 + h; ++y) {
+        for (int x = x0; x < x0 + w; ++x) {
+            out.push_back(get_material(x, y));
+        }
+    }
+    return out;
+}
+
+int World::set_materials_rect(int x0, int y0, int w, int h, const std::vector<MaterialType> &materials) {
+    int changed = 0;
+    size_t i = 0;
+    for (int y = y0; y < y0 + h; ++y) {
+        for (int x = x0; x < x0 + w; ++x) {
+            if (i >= materials.size()) return changed;
+            MaterialType incoming = materials[i++];
+            if (get_material(x, y) != incoming) {
+                set_cell(x, y, incoming);
+                ++changed;
+            }
+        }
+    }
+    return changed;
+}
+
+void World::set_movement_externally_owned(MaterialType material, bool owned) {
+    int idx = static_cast<int>(material);
+    if (idx < 0 || idx >= MATERIAL_COUNT) return;
+    externally_owned_movement_[idx] = owned;
+}
+
+bool World::is_movement_externally_owned(MaterialType material) const {
+    int idx = static_cast<int>(material);
+    if (idx < 0 || idx >= MATERIAL_COUNT) return false;
+    return externally_owned_movement_[idx];
 }
 
 bool World::consume_render_dirty(int cx, int cy) {

@@ -4,6 +4,13 @@ extends Node
 ## placement of WOOD/METAL/WATER/LAVA). Purely reads/writes the simulation
 ## grid through PixelSimWorld - no physics bodies are created for mined or
 ## placed material.
+##
+## GPU PRODUCTION WIRING: mining can drop SAND (from DIRT) and building can
+## place WATER directly - both are GPU-owned-movement materials (see
+## GPUProductionBridge). After either action, main.gpu_bridge.wake_region()
+## is called so the GPU active region actually covers the affected area -
+## harmless to call even when nothing GPU-relevant is there (Phase 2D's own
+## sleep logic settles a quiet region back down on its own).
 
 const DEFAULT_MINING_SIZE := 8
 const MIN_MINING_SIZE := 1
@@ -93,12 +100,19 @@ func _mine_at_cursor() -> void:
 	if particles:
 		var cell_size: int = sim_world.get_simulation_cell_size()
 		particles.spawn_dust(Vector2(cell.x * cell_size, cell.y * cell_size))
+	if main.gpu_bridge:
+		main.gpu_bridge.wake_region(cell.x, cell.y, mining_size + 2)
 
 func _build_at_cursor() -> void:
 	var cell := _cursor_cell()
-	if sim_world.place_cell(cell.x, cell.y, build_material) and particles:
+	var placed: bool = sim_world.place_cell(cell.x, cell.y, build_material)
+	if not placed:
+		return
+	if particles:
 		var cell_size: int = sim_world.get_simulation_cell_size()
 		particles.spawn_build_puff(Vector2(cell.x * cell_size, cell.y * cell_size))
+	if main.gpu_bridge:
+		main.gpu_bridge.wake_region(cell.x, cell.y, 4)
 
 func _draw_cursor_preview() -> void:
 	if cursor_preview == null or camera == null:
