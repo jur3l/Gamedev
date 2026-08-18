@@ -59,6 +59,36 @@ FPS is pinned at the ~144 Hz display-refresh ceiling throughout (see the methodo
 
 ---
 
+## Stress Test Measurement Methodology
+
+**Old behavior:** the harness ran for a fixed `MEASURE_DURATION = 6.0` seconds, then reported whatever FPS/`sim_ms` samples it collected in that window, regardless of whether the spawned SAND had actually finished falling. This was adequate for light tiers (10k settles well inside 6s) but silently meaningless for heavier ones — a 500k run's report reflected only its first 6 seconds of a settle process that actually takes ~20s, making tier-to-tier comparison invalid for exactly the question this harness exists to answer.
+
+**New behavior:** the harness now runs until the spawned SAND is **fully settled**, with **time to settle** as the primary metric — not a fixed window.
+
+**Settled definition:** `active_chunks == 0`, sustained for `SETTLE_CONFIRMATION_FRAMES = 5` consecutive sampled frames. `active_chunks == 0` is already SIMULATION_ACTIVATION.md's own correct stable-state signal (a chunk sleeps exactly when a full pass finds zero activity in it), and in this test's context — nothing external (mining, player, reactions) writes to the world while a tier is settling — a single true zero-read cannot be spontaneously undone by a later tick. The 5-frame confirmation streak is cheap extra insurance against a single-frame false read, not evidence the underlying signal was found unreliable.
+
+**Safety timeout:** `MAX_TEST_DURATION = 120.0` seconds — **not** a measurement window, a runaway/stuck-simulation guard only. If reached, the report says `TIMEOUT` explicitly rather than silently reporting partial data as if it were a complete result.
+
+**Primary metric:** wall-clock time to settle.
+
+**Secondary metrics**, collected over the **entire** settle duration (not an early window): avg/min/max FPS, avg/max `sim_ms`, peak `active_chunks`, and `passes_completed` (the CPU production path's own natural progress unit — see the note below on physical time).
+
+**A note on "physical simulation time":** the actual gameplay/production path (`main.gd` → `PixelSimWorld::step_simulation()` → `World::step()`) has no fixed-timestep/`dt` concept — `step_simulation()`'s own `delta` parameter is received and never used (confirmed directly in the C++ source). "Physical time" in a wall-clock-comparable sense is only a defined quantity for the experimental, not-production-wired GPU backend (Phase 2C, SIMULATION_TIMESCALE.md). This harness therefore reports `passes_completed` (one full bottom-to-top sweep — PROJECT_ARCHITECTURE.md §7) as the CPU path's own progress unit, not a fabricated "seconds" number.
+
+**Measured** (live, default world, cumulative run — same "not reset between tiers" caveat as the Baseline table above):
+
+| Sand | Settled | Time to settle | Avg FPS | Min FPS | Avg Sim ms | Peak Active |
+|---:|:---:|---:|---:|---:|---:|---:|
+| 10k | yes | 5.16s | 142.6 | 50.0 | 0.819 | 96 |
+| 50k | yes | 5.16s | 144.0 | 144.0 | 2.419 | 96 |
+| 100k | yes | 8.82s | 144.0 | 144.0 | 2.525 | 96 |
+| 250k | yes | 13.78s | 144.0 | 144.0 | 3.306 | 144 |
+| 500k | yes | 19.57s | 120.0 | 119.0 | 3.678 | 192 |
+
+All five tiers reached `SETTLED` — no timeouts. **Time to settle grows from 5.16s (10k) to 19.57s (500k), a ~3.8× real-time difference for a 50× cell-count difference** — the same directional finding SIMULATION_TIMESCALE_INVESTIGATION.md's earlier "fixed 100-passes" methodology already established (there: 5.85× for identical physical progress), now confirmed with a different, arguably more gameplay-relevant methodology ("how long until this actually stops moving," not "how long for a fixed number of passes"). The two numbers (3.8× vs 5.85×) are not expected to match — they measure different things (time-to-settle vs. time-for-fixed-progress) — but they agree on the same underlying fact: **heavier SAND tiers settle proportionally slower in real time on the current CPU production path.**
+
+---
+
 ## Simulation Scaling
 
 **Method:** standalone C++ benchmark, `World` API only, no Godot. Constructs a `World` at each target size, measures construction time and RSS memory delta, then runs 5 idle `step()` calls (**nothing placed** — every chunk starts and should stay asleep) to isolate "does world size alone cost anything."
