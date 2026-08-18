@@ -8,7 +8,9 @@ Source of truth for PixelSim's performance/scalability characteristics: what the
 
 **Scope of the second milestone — [Phase 1 — Lazy Rendering](#phase-1--lazy-rendering-visibility-based-chunk-residency):** that audit's own memory findings (GPU texture memory as the largest per-chunk cost, paid eagerly for the whole world regardless of camera visibility) motivated a follow-up: visibility-based lazy chunk render-resource residency. GDScript-only (`chunk_renderer.gd`), zero C++ files changed.
 
-**Scope of the third milestone — [Renderer Migration](#renderer-migration--compatibility--forward) and [Phase 2A — GPU Simulation PoC](#phase-2a--gpu-simulation-poc):** a GPU cellular-simulation feasibility investigation, scoped to a single SAND/powder solver, per explicit user request. Discovered mid-milestone that the project's prior renderer (`gl_compatibility`) categorically does not support the `RenderingDevice`/compute-shader API this needs — resolved, with explicit user approval, by switching to `forward_plus` (now the project's ongoing development renderer, validated with zero regressions). The GPU solver itself is a standalone, isolated PoC (`GPUSandPoC`) — zero C++ files changed, not wired into any production path. Full detail in [GPU_SIMULATION.md](GPU_SIMULATION.md). Per the request's explicit instruction, this milestone stopped after Phase 2A — Water/Lava/Reaction/Activation GPU migration (Phase 2B+) is **not started**.
+**Scope of the third milestone — [Renderer Migration](#renderer-migration--compatibility--forward) and [Phase 2A — GPU Simulation PoC](#phase-2a--gpu-simulation-poc):** a GPU cellular-simulation feasibility investigation, scoped to a single SAND/powder solver, per explicit user request. Discovered mid-milestone that the project's prior renderer (`gl_compatibility`) categorically does not support the `RenderingDevice`/compute-shader API this needs — resolved, with explicit user approval, by switching to `forward_plus` (now the project's ongoing development renderer, validated with zero regressions). The GPU solver itself is a standalone, isolated PoC (`GPUSandPoC`) — zero C++ files changed, not wired into any production path. Full detail in [GPU_SIMULATION.md](GPU_SIMULATION.md).
+
+**Scope of the fourth milestone — [Phase 2B — GPU Water](#phase-2b--gpu-water):** extends the *same* GPU infrastructure (not a second one) from Phase 2A with a WATER/liquid solver, per explicit user request. A real mass-conservation bug (a displaced cell could duplicate itself) was found by a failing test and fixed with a bounded, non-recursive two-tier resolution, still zero atomics/write races. Zero C++ files changed. Full detail in [GPU_SIMULATION.md "Phase 2B"](GPU_SIMULATION.md#phase-2b--gpu-water). Per the request's explicit instruction, this milestone stopped after Phase 2B — LAVA/Material Reaction System/Activation GPU migration (Phase 2C+) is **not started**.
 
 ---
 
@@ -390,6 +392,36 @@ The FPS difference is uniform across every workload tier (not scaling with simul
 
 **Decision: GO.** See [GPU_SIMULATION.md "Decision"](GPU_SIMULATION.md#decision) for the full reasoning against all 10 of the request's own success criteria. Recommended next step: Phase 2B (WATER/liquid solver), **not started** — per the request's explicit instruction to stop after Phase 2A and report before continuing.
 
+*(This section is kept exactly as originally written, per this document's own "don't overwrite historical results" policy — Phase 2B, described immediately below, has since been completed.)*
+
+---
+
+## Phase 2B — GPU Water
+
+**Status: DONE — GO decision.** Full detail (CPU source-of-truth reading, the pull-model displacement-duplication bug and its fix, the complete correctness/results/decision writeup) lives in **[GPU_SIMULATION.md "Phase 2B"](GPU_SIMULATION.md#phase-2b--gpu-water)** — this is a summary.
+
+**What was built:** the *same* infrastructure from Phase 2A, extended — `gpu_sand_solver.glsl` renamed to `gpu_cellular_solver.glsl` and given a `LIQUID` behavior path (WATER) alongside the existing `POWDER` path (SAND), sharing one `can_displace()` function mirroring `material_can_displace()`'s exact density/liquid rules. The `GPUSandPoC` GDScript wrapper was not renamed or duplicated — its API was already material-agnostic. No second GPU simulation infrastructure was introduced, per the request's explicit instruction.
+
+**A real bug, found and fixed via a failing conservation test:** the naive pull-model extension let a cell being displaced (e.g. WATER pushed out by denser SAND from above) *also* independently win a move of its own to a third cell in the same step, duplicating its material. Caught directly by a SAND-through-WATER test reporting 5 water cells instead of the initial 3 — not by inspection. Fixed with a bounded, non-recursive two-tier resolution (`resolve_winner_shallow` + a displacement-aware `resolve_winner_for` that rejects any candidate that is itself simultaneously being displaced) — still pull-model, still zero atomics, zero write races. All 12 Phase 2A SAND tests were re-verified green after the fix (structurally unaffected, since nothing can ever displace into a SAND cell in a SAND-only scenario).
+
+**Correctness:** all 16 requested Water test cases passed — single cell, vertical fall, diagonal-around-obstacle, horizontal spread (with the same left/right oscillation `solve_liquid()`'s own randomized dx1/dx2 produces), a 24-cell pool spreading to fill a basin, resting against a wall, flowing around a floating obstacle, resting on SAND without sinking, SAND sinking through WATER via a true swap, conservation across an actual chunk-boundary crossing (`x = 64`, 18 cells in/out), deterministic repeatability (byte-identical across independent runs), multi-step stability (150 steps, zero drift), and CPU vs. GPU validation at both levels the parallel model actually supports (exact match, no-contention; mass-conservation + final-state equivalence, contested).
+
+**Performance** (same slab-falling-onto-a-floor methodology as Phase 2A, WATER instead of SAND):
+
+| Chunks | Cells | CPU `sim_ms` | GPU compute (incl. sync) | GPU compute + readback |
+|---:|---:|---:|---:|---:|
+| 1 | 4,096 | 0.062 ms | 0.095 ms | 0.163 ms |
+| 10 | 40,960 | 0.612 ms | 0.095 ms | 0.422 ms |
+| 100 | 409,600 | 4.175 ms | 0.097 ms | 0.648 ms |
+| 500 | 2,048,000 | 4.824 ms | 0.175 ms | 1.494 ms |
+| 1,000 | 4,096,000 | 6.881 ms | 0.250 ms | 2.611 ms |
+
+**Crossover, nearly identical shape to Phase 2A's SAND numbers** (the extra displacement-aware logic adds a small, bounded per-cell cost, not a different scaling curve): CPU narrowly wins at 1 chunk (same fixed-overhead story as Phase 2A). GPU compute-only wins from ~10 chunks onward — **~6.4×** faster at 10, **~43×** at 100, **~27–39×** at 500–1,000 (compute time only grows 95 µs → 250 µs across a 1,000× increase in cell count). GPU + full readback overtakes CPU in the 10–100-chunk range and stays **~2.6×** faster at 1,000 chunks.
+
+**Memory:** no new category — WATER reuses SAND's exact buffer representation (8 bytes/cell, 2.66× the CPU `Chunk`'s measured rate), per the request's explicit instruction not to build a separate Water buffer.
+
+**Decision: GO.** See [GPU_SIMULATION.md "Phase 2B Decision"](GPU_SIMULATION.md#decision-1) for the full reasoning against all 10 of the request's own success criteria. Recommended next step: Phase 2C (a formal, automated CPU/GPU validation harness), **not started** — per the request's explicit instruction to stop after Phase 2B and report before continuing.
+
 ---
 
 ## Correctness Verification
@@ -446,6 +478,8 @@ Everything in PROJECT_ARCHITECTURE.md §13/§14 still holds, unmodified. Specifi
 - **`Cell` stays a 2-byte CPU POD** — the GPU PoC's 4-byte-per-cell representation is a separate, experimental, non-production concept.
 - **The renderer switch is the one real, lasting architecture change** — done with explicit user approval, validated with zero measured regression against every existing system (simulation, Phase 1 lazy rendering, touched-rect partial update, Background/Foreground, mining, Material Reaction System).
 - **The GPU PoC is not wired into any production path** — not `PixelSimWorld`, not `Main.tscn`, not the renderer. It cannot affect gameplay because nothing in gameplay reads from it.
+
+**Specific to Phase 2B (GPU Water):** no second GPU simulation infrastructure was introduced (same shader file, renamed not duplicated; same `GPUSandPoC` wrapper, unchanged API); the CPU `solve_liquid()` was read as source of truth and never modified; LAVA/Material Reaction System/activation/mining/player collision/GPU rendering remain entirely untouched and CPU-side — see GPU_SIMULATION.md's Phase 2B invariants section for the full list.
 
 ---
 

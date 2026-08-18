@@ -1,9 +1,18 @@
 class_name GPUSandPoC
 extends RefCounted
-## Phase 2A GPU simulation feasibility PoC (GPU_SIMULATION.md). EXPERIMENTAL -
-## not the production simulation backend. Wraps a LOCAL RenderingDevice
-## (RenderingServer.create_local_rendering_device()) running a ping-pong
-## compute-shader SAND solver (shaders/gpu_sand_solver.glsl).
+## GPU simulation feasibility PoC (GPU_SIMULATION.md): Phase 2A (SAND) +
+## Phase 2B (WATER). EXPERIMENTAL - not the production simulation backend.
+## Wraps a LOCAL RenderingDevice (RenderingServer.create_local_rendering_device())
+## running a ping-pong compute-shader solver (shaders/gpu_cellular_solver.glsl).
+##
+## Class name kept as GPUSandPoC across Phase 2B (not renamed) - it is a
+## thin, material-agnostic buffer/dispatch/readback wrapper (setup_grid/step/
+## read_back all just move PackedInt32Array material IDs around); only the
+## shader gained WATER-specific behavior. Renaming it would have been pure
+## churn for no behavioral reason, and the request's own instruction was to
+## reuse this infrastructure, not introduce a second one - see
+## GPU_SIMULATION.md "Phase 2B" for why the shader itself WAS renamed
+## (gpu_sand_solver.glsl -> gpu_cellular_solver.glsl) while this class was not.
 ##
 ## Deliberately standalone: a RefCounted, not a Node, not wired into
 ## PixelSimWorld, Main.tscn, or the production render pipeline in any way -
@@ -15,10 +24,11 @@ extends RefCounted
 ## GPU-unavailable is a normal, non-fatal outcome (see init()) - the CPU
 ## backend (the real PixelSimWorld/World) is completely unaffected either way.
 
-const SHADER_PATH := "res://shaders/gpu_sand_solver.glsl"
+const SHADER_PATH := "res://shaders/gpu_cellular_solver.glsl"
 const MAT_AIR := 0
 const MAT_SAND := 1
 const MAT_STONE := 2
+const MAT_WATER := 3
 
 var available := false
 var width := 0

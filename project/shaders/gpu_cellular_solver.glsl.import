@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://dcokjhfeltjoh"
+path="res://.godot/imported/gpu_cellular_solver.glsl-610f9a2662bfa0d7b8af15d553c2dbd3.res"
+
+[deps]
+
+source_file="res://shaders/gpu_cellular_solver.glsl"
+dest_files=["res://.godot/imported/gpu_cellular_solver.glsl-610f9a2662bfa0d7b8af15d553c2dbd3.res"]
+
+[params]
+

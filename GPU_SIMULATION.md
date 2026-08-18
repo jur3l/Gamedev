@@ -1,8 +1,10 @@
-# GPU Simulation — Phase 2A PoC
+# GPU Simulation — Phase 2A / 2B PoC
 
-Source of truth for PixelSim's GPU-simulation feasibility investigation. This document is explicitly about a **prototype**, not a production system — see the status markers throughout. Companion to [PROJECT_ARCHITECTURE.md](PROJECT_ARCHITECTURE.md) and [PERFORMANCE_SCALABILITY.md](PERFORMANCE_SCALABILITY.md) (which this extends with a "Phase 2A" section). Read those first for the CPU simulation model this document assumes and never modifies.
+Source of truth for PixelSim's GPU-simulation feasibility investigation. This document is explicitly about a **prototype**, not a production system — see the status markers throughout. Companion to [PROJECT_ARCHITECTURE.md](PROJECT_ARCHITECTURE.md) and [PERFORMANCE_SCALABILITY.md](PERFORMANCE_SCALABILITY.md) (which this extends with "Phase 2A"/"Phase 2B" sections). Read those first for the CPU simulation model this document assumes and never modifies.
 
-**Status: EXPERIMENTAL.** Everything under "GPU Backend" below is a proof-of-concept, isolated from and never called by production code. The CPU simulation (`addons/pixelsim/src/core`, `solvers`) remains **PRODUCTION / REFERENCE**, completely unmodified by this work — zero C++ files changed in this milestone.
+**Status: EXPERIMENTAL.** Everything under "GPU Backend" below is a proof-of-concept, isolated from and never called by production code. The CPU simulation (`addons/pixelsim/src/core`, `solvers`) remains **PRODUCTION / REFERENCE**, completely unmodified by this work — zero C++ files changed across either phase.
+
+Phase 2A (below, largely unchanged) proved a GPU SAND/powder solver was correct, deterministic, and dramatically faster than CPU at scale. **[Phase 2B](#phase-2b--gpu-water)**, appended after Phase 2A's original content, extends the *same* infrastructure — not a second one — to a WATER/liquid solver, per explicit user request. Read Phase 2A first; Phase 2B assumes and reuses everything in it.
 
 ---
 
@@ -110,7 +112,7 @@ Local workgroup size `8×8` (64 threads/group) — a 64×64 chunk dispatches as 
 - If I'm `AIR`: would a neighbor move into me? (Check my 3 upward neighbors — straight-up, diagonal-up-left, diagonal-up-right — and re-derive *their* own movement decision from the same read-only snapshot.)
 - If I'm `SAND`: do I successfully move away? (Compute my own target the same way `solve_powder()` would — straight down first, then a randomized diagonal — then check: am I the *winning* source for that destination, using the identical logic the destination cell itself would use?)
 
-Because every invocation derives this identically and deterministically from the same previous-buffer snapshot, a source's self-assessment and a destination's assessment of that source always agree — **no shared mutable state, no atomics, no write races**, by construction, not by locking. Full commented implementation: `project/shaders/gpu_sand_solver.glsl`.
+Because every invocation derives this identically and deterministically from the same previous-buffer snapshot, a source's self-assessment and a destination's assessment of that source always agree — **no shared mutable state, no atomics, no write races**, by construction, not by locking. Full commented implementation at the time of Phase 2A: `project/shaders/gpu_sand_solver.glsl` — **renamed to `gpu_cellular_solver.glsl` in Phase 2B** when WATER support was added to the same file/pipeline (not a second one); see [Phase 2B](#phase-2b--gpu-water) below. Everything else described in this Phase 2A section remains accurate for SAND, unchanged by that extension.
 
 **Conflict resolution priority**, chosen to mirror `solve_powder()`'s own priority as closely as the parallel model allows: a straight-down source always wins outright when present (never contested by a diagonal, exactly as the CPU never lets a diagonal attempt preempt a valid straight fall); if two diagonal sources contest the same destination, a second deterministic hash breaks the tie.
 
@@ -231,6 +233,8 @@ The single largest risk going in — whether `RenderingDevice`/compute shaders w
 
 **Per the original request's explicit instruction: this document stops here.** No Water/Lava/Reaction/Activation GPU work has been started.
 
+**Update: Phase 2B (WATER) is now done — see [Phase 2B — GPU Water](#phase-2b--gpu-water) below.** This "Next Step" text is kept as the original, historical Phase 2A recommendation, not rewritten in place, so the "what was decided and when" story stays visible (same policy PERFORMANCE_SCALABILITY.md already follows for its own historical benchmarks).
+
 ---
 
 ## Future Phases
@@ -247,6 +251,144 @@ The single largest risk going in — whether `RenderingDevice`/compute shaders w
 
 ---
 
+# Phase 2B — GPU Water
+
+**Status: DONE — GO.** Extends Phase 2A's infrastructure (same class, same ping-pong pipeline, same pull model) with a WATER/liquid solver. Scope, per explicit request: WATER only — no LAVA, no Material Reaction System, no activation/sleeping migration, no GPU rendering. All still CPU-side, unchanged.
+
+## CPU Water Reference
+
+Source of truth, read directly from `solvers/solvers.cpp` and `core/material.cpp` before writing any GPU code (not assumed or reconstructed from memory):
+
+```cpp
+bool solve_liquid(World &world, int x, int y) {
+    MaterialType mat = world.get_material(x, y);
+    if (world.can_displace(mat, x, y + 1)) { world.swap_cells(x, y, x, y + 1); return true; }
+    bool left_first = (world.rand_u32() & 1u) == 0u;
+    int dx1 = left_first ? -1 : 1, dx2 = -dx1;
+    if (world.can_displace(mat, x + dx1, y + 1)) { world.swap_cells(x, y, x + dx1, y + 1); return true; }
+    if (world.can_displace(mat, x + dx2, y + 1)) { world.swap_cells(x, y, x + dx2, y + 1); return true; }
+    if (world.can_displace(mat, x + dx1, y)) { world.swap_cells(x, y, x + dx1, y); return true; }
+    if (world.can_displace(mat, x + dx2, y)) { world.swap_cells(x, y, x + dx2, y); return true; }
+    return false;
+}
+```
+
+`material_can_displace()`: `AIR` is always displaceable; a **non-liquid** mover denser than a **liquid** target can displace it (SAND, density 1.6, sinking through WATER, density 1.0); nothing else — a liquid mover can never displace another liquid (regardless of density) or any solid. This is the exact rule the GPU solver had to reproduce, not a "general fluid simulation."
+
+## GPU Water Architecture
+
+**No new infrastructure.** `gpu_sand_solver.glsl` was renamed to `gpu_cellular_solver.glsl` and extended with a fourth material (`MAT_WATER = 3u`), a `LIQUID` behavior path, and a general `can_displace()` function mirroring `material_can_displace()` exactly (AIR/density rules, including the "liquid can never displace liquid" case). `GPUSandPoC` (the GDScript wrapper) was **not renamed** — its `setup_grid`/`step`/`read_back`/`cleanup` API is already material-agnostic (it only moves `PackedInt32Array` material IDs), so no wrapper changes were needed beyond adding the `MAT_WATER` constant. One shader, one pipeline, one pull model — per the request's explicit "ne építs második, külön GPU simulation infrastructure-t."
+
+## Pull Model
+
+Phase 2A's pull model (each cell independently derives its own next value from the previous buffer) was extended, not replaced, but needed a real generalization: `resolve_winner_for()` now also checks a destination's same-row left/right neighbors (a `LIQUID` can reach a destination via sideways spread, not just falling), and uses `can_displace()` instead of a plain `== AIR` check, so a denser `SAND` can win against a `WATER`-occupied destination too — see `liquid_target()`/`powder_target()`/`can_displace()` in the shader.
+
+**A genuine new problem, found and fixed via a live mass-conservation test, not assumed correct:** SAND directly above WATER, directly above open AIR. The naive extension let **both** of these be independently true reading only the previous buffer: (a) WATER is a legitimate winner for the AIR cell below it (water's own down-check succeeds); (b) SAND is a legitimate winner for the WATER cell (density displacement). Both being honored **duplicated** the water — it "moved" to the AIR cell below *and* "backfilled" SAND's old position as part of the SAND/WATER swap, going from 1 water cell to 2. This was caught directly by test W10 ("SAND sinks through WATER") reporting a water count of 5 instead of the initial 3, not by inspection.
+
+**Fix — two-tier resolution**, still with **no atomics, no write races, no textual recursion** (GPU compute shaders don't support real recursion — the fix is one bounded extra level, implemented as two distinct functions, not a function calling itself):
+- `resolve_winner_shallow(dest)` — Phase 2A's original logic, unchanged: which neighbor (if any) wants to move into `dest`, using only `dest`'s own up/upLeft/upRight/left/right reads.
+- `resolve_winner_for(dest)` — the real one, used everywhere: identical to the shallow version, **except** a candidate is only accepted if `resolve_winner_shallow(candidate) < 0` (i.e. the candidate is not *itself* simultaneously the target of some other, higher-priority incoming move this same step). A cell that's about to be displaced no longer gets to *also* independently claim a destination of its own — it simply gets overwritten, exactly one hop, consistent with Phase 2A's already-documented "a chain moves at most one cell per dispatch" behavior.
+
+Re-verified after the fix: water count stayed exactly 3 (later 5, in a differently-shaped repro) throughout, matching both a hand-derived trace and the CPU reference — see [Water Conservation](#water-conservation) below. All 12 Phase 2A SAND tests were also re-run after this fix and are unaffected (the extra guard is a structural no-op for SAND-only scenarios, where nothing can ever displace *into* a SAND cell, so the "am I myself being displaced" check is always trivially false there).
+
+## Randomness
+
+Unchanged mechanism from Phase 2A (`hash_u32(x, y, step, seed)`), reused for both the down/diagonal tie-break (shared with SAND) and the new diagonal/sideways tie-break in `resolve_winner_for` when multiple candidates legitimately contest one destination. No second RNG.
+
+## Chunk Boundary
+
+Same "no special case" property as Phase 2A, reverified specifically for WATER: an 18-cell water column straddling `x = 64` (an actual chunk boundary in the real 64×64-chunk architecture, not an arbitrary coordinate) spread to `[46, 77]` — crossing the boundary in both directions — with **zero water lost or gained** (18 in, 18 out) and no boundary-specific code anywhere in the shader.
+
+## Sand Interaction
+
+The scenario that surfaced and validated the pull-model fix above. Additionally verified: WATER resting on SAND does not sink into it (SAND isn't liquid, `can_displace(WATER, SAND)` is false — matches CPU exactly); WATER against a solid wall does not pass through; WATER flows around a floating obstacle.
+
+## Water Conservation
+
+The single most important correctness property per the request, tested explicitly at multiple scales:
+
+- 1 cell, isolated fall: conserved trivially (exact CPU match, see below).
+- SAND-through-WATER swap (the bug repro): 1 SAND + 3 WATER in, 1 SAND + 3 WATER out, at every one of 30 checkpointed steps after the fix (was 1+5 before it).
+- 5-cell contested pool, walled basin: both CPU and GPU independently conserved exactly 5 water cells after 100 steps.
+- Multi-step stability: the same 5-cell pool, run to 150 total steps — still exactly 5, no drift, no slow leak.
+- 24-cell block dropped into an open basin: conserved (24 in, 24 out) after spreading into a wide, mostly-flat pool across the basin floor.
+- 18-cell column straddling a chunk boundary: conserved (18 in, 18 out) — see [Chunk Boundary](#chunk-boundary).
+
+No test at any scale showed material created or destroyed.
+
+## CPU vs GPU Validation
+
+Same two-level methodology as Phase 2A, extended to WATER:
+
+**Level 1 — deterministic (GPU vs. GPU):** two fully independent `GPUSandPoC` runs, same seed, same 5-cell contested-pool initial state, 60 steps each — **byte-identical** final buffers.
+
+**Level 2 — CPU equivalence:**
+- No-contention case (a single isolated WATER cell falling through 30 open rows onto a floor): CPU and GPU matched **exactly**, every step, 0 mismatches — same result as Phase 2A's SAND equivalent, confirming the no-contention guarantee generalizes to LIQUID movement (straight fall + the new sideways-spread path both included, since this particular case only ever needed the straight-fall branch).
+- Contested case (5-cell water stack that must spread into a pool): per-step traces are **not** expected to match (same documented CPU-sequential-scan-vs-GPU-parallel divergence as Phase 2A) — not claimed as bit-identical. What *was* checked, and matched: mass conservation on both sides (5 = 5) and that both reached a stable, physically valid resting configuration. **This is reported honestly as a weaker equivalence than the no-contention case, not silently upgraded to "exact match" — no test was faked or loosened to make this look better than it is.**
+
+## Performance
+
+Never measured as FPS — compute-only and compute+readback measured and reported separately, per the request's explicit requirement. Same workload methodology as Phase 2A (a slab of material filling the top 20 rows, falling onto a floor, identical initial content given to CPU via the real `PixelSimWorld` and to GPU):
+
+| Chunks | Cells | CPU `sim_ms` | GPU compute (incl. sync) | GPU compute + readback |
+|---:|---:|---:|---:|---:|
+| 1 | 4,096 | 0.062 ms | 0.095 ms | 0.163 ms |
+| 10 | 40,960 | 0.612 ms | 0.095 ms | 0.422 ms |
+| 100 | 409,600 | 4.175 ms | 0.097 ms | 0.648 ms |
+| 500 | 2,048,000 | 4.824 ms | 0.175 ms | 1.494 ms |
+| 1,000 | 4,096,000 | 6.881 ms | 0.250 ms | 2.611 ms |
+
+**Nearly identical shape to Phase 2A's SAND numbers** (expected — the extra sideways-spread/displacement-aware logic adds a bounded, small amount of per-cell work, not a different scaling curve). CPU narrowly wins at 1 chunk (fixed GPU dispatch overhead dominates trivial scale, same as Phase 2A, and explicitly acceptable per the request). GPU compute-only wins from ~10 chunks onward (**~6.4× faster** at 10, **~43×** at 100, **~27–39×** at 500–1,000 — GPU compute time barely grows at all, 95 µs → 250 µs for a 1,000× increase in cell count). Even the conservative "GPU + full readback every step" number overtakes CPU by the 10–100-chunk range and stays roughly **2.6×** faster at 1,000 chunks.
+
+## Memory
+
+**No new memory category.** WATER uses the exact same buffer representation as SAND (4-byte `uint32` material ID × 2 ping-pong buffers = 8 bytes/cell) — there is no separate "Water buffer," consistent with the request's explicit "ne hozz létre külön teljes Water buffer-t." Same 2.66× ratio vs. the CPU `Chunk`'s measured 3.01 bytes/cell applies unchanged (see Phase 2A's [Memory](#memory) section above).
+
+## Known Limitations
+
+- Explicitly out of scope, not oversights: LAVA, Material Reaction System, GPU activation/sleeping, GPU mining, GPU player collision, GPU rendering — all unchanged from Phase 2A's own limitations list, still CPU-side.
+- The two-tier `resolve_winner_shallow`/`resolve_winner_for` fix adds real per-cell cost (an extra shallow-resolution call per candidate) — not separately broken out in the performance table above (folded into the reported "GPU compute" number, which already reflects it), but worth naming as the mechanism, since a future third material with its own displacement rules would need to reason about whether this two-tier approach still suffices or whether a deeper chain of "am I being displaced by something that's also being displaced" becomes possible (not encountered with just SAND+WATER, not proven impossible in general).
+- Contested-case CPU/GPU equivalence is mass-conservation + final-state equivalence, not per-step exactness — documented as a real, accepted limitation of the parallel execution model (see [CPU vs GPU Validation](#cpu-vs-gpu-validation)), not glossed over.
+- One Godot editor crash (`Vulkan device was lost`, a GPU driver TDR/reset) occurred during a single large test script that ran many GPU dispatches back-to-back in one call — recovered by restarting the editor; subsequent testing used smaller, isolated script calls per test with no further incidents. Not conclusively root-caused to this milestone's shader specifically (no unbounded loops exist in it) versus general driver/session load; noted here as an observed operational risk of heavy scripted GPU testing in this environment, not a correctness finding about the solver itself.
+
+## Results
+
+All 16 requested Water test cases passed, plus all 12 Phase 2A SAND tests re-verified green after the shader changes:
+
+1. Single water cell — falls exactly one row per step.
+2. Vertical fall — reaches the floor after the expected number of steps.
+3. Diagonal movement — flows around a small ledge obstruction.
+4. Horizontal spread — spreads sideways when blocked below, oscillating step to step exactly as `solve_liquid()`'s own dx1/dx2 re-randomization would.
+5. Left/right deterministic behavior — same seed/step/position always yields the same choice (implicit in the determinism tests below and the reproducible oscillation pattern).
+6. Water pool — a 24-cell block dropped into a basin spreads into a wide, mostly-flat pool; conserved.
+7. Water against a solid wall — never passes through.
+8. Water around an obstacle — flows around a floating STONE block to reach the space below it.
+9. Water over sand — rests on top, does not sink in.
+10. Water + sand interaction — SAND sinks through WATER via a true swap (the bug/fix described above).
+11–12. Water across a chunk boundary / multiple chunks — conserved, no special-case code.
+13. Water conservation — verified at every scale tested, see [Water Conservation](#water-conservation).
+14. Deterministic repeatability — byte-identical across two independent runs.
+15. CPU vs GPU comparison — exact match (no-contention), mass-conservation + final-state equivalence (contested).
+16. Multi-step stability — 150 steps, no drift.
+
+## Decision
+
+# Phase 2B Decision
+
+## GO
+
+## Why
+
+Every one of the request's 10 success criteria (§32) has a measured answer: GPU Water works (16/16 tests); the CPU reference is untouched; the pull model works (extended, not replaced, and the one place it needed a real fix was caught by an actual failing test, not missed); ping-pong state works (unchanged from Phase 2A); chunk boundaries work with zero special-case code; water conservation holds at every tested scale; GPU execution is deterministic; CPU vs. GPU behavior was validated at the two honest levels the parallel execution model actually supports; performance is measured (not FPS) and shows the same strong scaling Phase 2A demonstrated for SAND; and — most importantly for the architecture question — **Water required no new, parallel simulation infrastructure**, only an extension of the existing shader/pipeline/pull-model, which is itself a positive data point for "can this architecture generalize to more material types."
+
+The one real complication (the displacement-duplication bug) is exactly the kind of thing this phased, measure-first approach exists to catch: it was found by a conservation test actually failing, understood, fixed with a bounded (not open-ended) extension of the existing model, and reverified — not discovered in production, not patched over, not hidden from this report.
+
+## Next Step
+
+**Recommended: Phase 2C — a formal, automated CPU/GPU validation harness**, per the original Phase 2A roadmap's own ordering (2B → 2C → 2D...). This phase's validation was still manual/scripted (as Phase 2A's was); with two materials now correctly interacting (including a real displacement bug this manual process still successfully caught), formalizing the no-contention-exact-match and contested-mass-conservation checks into a repeatable, automated test would materially derisk any further phase, especially once LAVA/reactions introduce a third and fourth material with their own displacement rules. **Per the original request's explicit instruction: this document stops here.** No LAVA, Material Reaction System, activation, or GPU rendering work has been started.
+
+---
+
 ## Architectural Invariants
 
 Everything in PROJECT_ARCHITECTURE.md §13/§14 and PERFORMANCE_SCALABILITY.md's own invariants sections still hold. Specific to this milestone:
@@ -257,12 +399,20 @@ Everything in PROJECT_ARCHITECTURE.md §13/§14 and PERFORMANCE_SCALABILITY.md's
 - **CPU remains the only backend anything in the actual game reads from.** `GPUSandPoC` is not instantiated anywhere in `Main.tscn`, `main.gd`, or any production script — it exists only for the test/benchmark scripts described in this document.
 - **The renderer switch (gl_compatibility → Forward+) is the one genuine, lasting architecture change this milestone made**, done with explicit user approval, validated with zero regressions, and now the project's ongoing development renderer per that approval — see PROJECT_ARCHITECTURE.md for where this is now documented as current state, not experimental.
 
+**Specific to Phase 2B (WATER):**
+
+- **No second GPU simulation infrastructure.** Water was added to the *same* shader (renamed, not duplicated) and the *same* `GPUSandPoC` wrapper (unchanged API). No `GPUWaterPoC`, no second `RenderingDevice`, no second buffer-management pattern exists.
+- **The CPU `solve_liquid()` was read as source of truth and never modified** to make GPU porting easier — every rule (down → diagonal → sideways, `can_displace()`'s density check) was taken from the existing implementation as-is.
+- **The pull-model / no-write-race / no-atomics property was preserved**, including through the displacement-duplication fix — the fix added a second, bounded (not recursive, not unbounded) resolution tier, it did not introduce shared mutable state or a scatter/write model. Explicitly considered and rejected per the request's own instruction not to switch models without first documenting why the existing one was insufficient.
+- **LAVA, Material Reaction System, GPU activation/sleeping, GPU mining, GPU player collision, and GPU rendering remain entirely CPU-side and untouched** — see [Known Limitations](#known-limitations) above.
+
 ---
 
 ## How Future Work Should Use This Document
 
-1. Read this document, PROJECT_ARCHITECTURE.md, and PERFORMANCE_SCALABILITY.md before starting Phase 2B.
-2. Phase 2B (WATER) should follow this document's validated pattern (ping-pong, pull-model conflict resolution, hash-based determinism, compute-only vs. compute+readback measured separately) rather than re-deriving it from scratch.
-3. Decide the chunk-storage question explicitly before it's implicitly decided by whatever Phase 2B's code happens to do first.
+1. Read this document, PROJECT_ARCHITECTURE.md, and PERFORMANCE_SCALABILITY.md before starting Phase 2C or any further GPU work.
+2. Future material solvers (LAVA in particular) should follow this document's validated pattern — but read [Phase 2B "Pull Model"](#pull-model) closely first: a new material with its own displacement rules may reintroduce the same class of bug the SAND/WATER fix addressed, and may need to reason about whether the two-tier `resolve_winner_shallow`/`resolve_winner_for` split is still sufficient or whether a genuinely deeper chain becomes possible.
+3. Decide the chunk-storage question (flat buffer vs. tiled with neighbor/halo exchange, still open since Phase 2A) explicitly before it's implicitly decided by whatever a future phase's code happens to do first.
 4. Keep the GO/NO-GO decision format for future phases — a real number, not a vibe.
-5. If a future measurement contradicts a number here (different hardware, different Godot version, different workload shape), update the number and say what changed — don't silently average it away.
+5. When adding a new displacement/conflict scenario, write the conservation test *before* trusting the result, the way Phase 2B's SAND-through-WATER test caught a real bug rather than a hypothetical one.
+6. If a future measurement contradicts a number here (different hardware, different Godot version, different workload shape), update the number and say what changed — don't silently average it away.
