@@ -87,6 +87,48 @@ FPS is pinned at the ~144 Hz display-refresh ceiling throughout (see the methodo
 
 All five tiers reached `SETTLED` — no timeouts. **Time to settle grows from 5.16s (10k) to 19.57s (500k), a ~3.8× real-time difference for a 50× cell-count difference** — the same directional finding SIMULATION_TIMESCALE_INVESTIGATION.md's earlier "fixed 100-passes" methodology already established (there: 5.85× for identical physical progress), now confirmed with a different, arguably more gameplay-relevant methodology ("how long until this actually stops moving," not "how long for a fixed number of passes"). The two numbers (3.8× vs 5.85×) are not expected to match — they measure different things (time-to-settle vs. time-for-fixed-progress) — but they agree on the same underlying fact: **heavier SAND tiers settle proportionally slower in real time on the current CPU production path.**
 
+**Superseded by [Stress Test Isolation](#stress-test-isolation) below.** The table above was run **cumulatively** — all five tiers on the same `World` instance, each tier's SAND spawning on top of the previous tier's already-settled pile rather than onto fresh terrain. That's a different initial condition per tier, which invalidates tier-to-tier comparison (a later tier's "time to settle" partly reflects displacing/absorbing the earlier tiers' leftover SAND, not a clean fall from empty terrain). Kept here, unmodified, as a historical record of what the non-isolated methodology produced — the isolated table below is the one to use for any real comparison (including the planned CPU/GPU baseline).
+
+---
+
+## Stress Test Isolation
+
+**Problem:** running the five tiers back-to-back on the same `World`/scene instance (as the table above did) means each tier after the first starts with SAND already resting on the terrain from the previous tier — a different physical initial condition per tier. "Time to settle" comparisons across tiers are only meaningful if every tier starts from the *same* initial condition, varying **only** in SAND cell count.
+
+**Fix:** every tier now runs from a genuinely fresh scene. The harness (`stress_test.gd`) cannot safely reset itself mid-run — Godot's scene-reload lifecycle would free the very node driving the test — so isolation is externally orchestrated: `stop_scene()` → `play_scene()` (Godot MCP Pro tooling) before every single tier, giving a brand-new `Main` scene instance, a brand-new `World` C++ instance, a brand-new renderer, and freshly-generated terrain from the same hardcoded `world_seed = 1337` (`main.gd`'s `_ready()`) each time. Only the SAND spawn count differs between tiers; terrain, world size, spawn geometry, and configuration are identical every time.
+
+**Fresh Scene Requirement:** mandatory for every tier, no exceptions. A tier is never triggered on a scene that has run any previous tier.
+
+**Initial State:** immediately after `play_scene()` and terrain generation, before any SAND is spawned, the world is quiet — `active_chunks == 0` — since nothing but terrain generation (long since finished and settled) has touched it.
+
+**Terrain Seed:** `world_seed = 1337` (hardcoded in `main.gd`), identical across every tier and every run — never varied.
+
+**Sand Spawn:** unchanged wide-slab geometry (`_start_test()`'s existing `fill_rect` loop, margin=10, width capped to world bounds, height capped to a third of the world) — the only thing that varies per tier is the requested cell count (10k/50k/100k/250k/500k).
+
+**Validation:** `_start_test()` reads `active_chunks` via `sim_world.get_stats()` **before** spawning any SAND and records it as `active_chunks_before_spawn`. `test_valid := (active_chunks_before_spawn == 0)`. If a tier is ever triggered on a scene that isn't genuinely fresh (leftover activity from a previous test), `test_valid` is `false`, the console prints an explicit `NO - ...` line instead of silently proceeding, and the final report carries a `** WARNING: TEST INVALID ... **` note plus a `NO (INVALID)` cell in the "Fresh Scene" column — never presented as a normal, comparable data point. All five tiers below were confirmed `active_chunks_before_spawn == 0` / `Test Valid: YES` before being recorded.
+
+**Settling Condition:** unchanged from [Stress Test Measurement Methodology](#stress-test-measurement-methodology) above — `active_chunks == 0` sustained for `SETTLE_CONFIRMATION_FRAMES = 5` consecutive frames.
+
+**Time to Settle:** wall-clock timer starts at the moment SAND spawn completes (`_start_test()`'s own `elapsed = 0.0` reset, after the `fill_rect` loop) and stops the instant settling is confirmed. Scene-restart/terrain-generation time (the `stop_scene()`/`play_scene()`/terrain-generation interval before `_start_test()` is even called) is never included in this number.
+
+**Performance Metrics:** avg/min/max FPS, avg/max `sim_ms`, and peak `active_chunks`, collected over the whole settle duration exactly as before — unaffected by this round's isolation change.
+
+**Safety Timeout:** unchanged, `MAX_TEST_DURATION = 120.0` seconds, a runaway-simulation guard only, not a measurement window.
+
+**Every stress-test tier starts from a fresh scene and identical terrain initial state. No tier inherits simulation state from a previous tier.**
+
+**Measured** (live, `stop_scene()`/`play_scene()` restart before every tier, `Test Valid: YES` confirmed for every tier before recording):
+
+| Tier | Fresh Scene | Sand | Settled | Time to Settle | Avg FPS | Min FPS | Avg Sim ms | Peak Active |
+|---:|:---:|---:|:---:|---:|---:|---:|---:|---:|
+| 1 | yes | 10k | yes | 3.10s | 240.0 | 240.0 | 0.768 | 96 |
+| 2 | yes | 50k | yes | 3.14s | 240.0 | 240.0 | 2.271 | 96 |
+| 3 | yes | 100k | yes | 5.50s | 239.8 | 239.0 | 2.363 | 96 |
+| 4 | yes | 250k | yes | 9.66s | 207.6 | 197.0 | 3.520 | 144 |
+| 5 | yes | 500k | yes | 15.36s | 205.9 | 196.0 | 3.703 | 192 |
+
+All five tiers reached `SETTLED` with `Fresh Scene: yes` confirmed — no timeouts, no invalid tiers. **Time to settle grows from 3.10s (10k) to 15.36s (500k), a ~5.0× real-time difference for a 50× cell-count difference**, now measured from a genuinely identical starting condition every time. This is the credible baseline for the next CPU/GPU comparison — every tier's "time to settle" reflects only that tier's own SAND falling onto the same empty, freshly-generated terrain, nothing else.
+
 ---
 
 ## Simulation Scaling
