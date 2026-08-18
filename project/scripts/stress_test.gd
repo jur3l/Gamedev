@@ -57,6 +57,21 @@ extends Node
 ## secondary diagnostic metrics only - TIME TO SETTLE remains primary (see
 ## "Measurement lifecycle rewrite" above); an uncapped frame rate makes those
 ## secondary numbers actually meaningful, it doesn't change what's primary.
+##
+## RENDER FPS != PHYSICS SPEED (see SIMULATION_TIMESCALE.md "CPU Fixed
+## Timestep"): `main.gd` now drives the simulation through
+## `CPUSimulationBackend`, a fixed-timestep accumulator (`fixed_dt = 1/60s`,
+## the project's existing Phase 2C convention) gating calls to the
+## unmodified `PixelSimWorld.step_simulation()`. Physical simulation
+## progress (`passes_completed`, `physical_simulation_time`, `tick_count`)
+## is read from `main.cpu_backend` - its own monotonic clock, never derived
+## from this script's per-frame sampling - specifically because sampling
+## `sim_world.get_stats()` once per render frame would double-count
+## `pass_completed` on frames where the accumulator didn't fire a tick at
+## all (the stats dict simply holds the last tick's result until the next
+## one runs). Wall-clock "Time to settle" and physical "simulation time" are
+## reported side by side and are NOT the same number - see "Wall Clock vs
+## Physical Clock" below.
 
 const TIERS := {
 	KEY_1: 10000,
@@ -71,6 +86,7 @@ const SETTLE_CONFIRMATION_FRAMES := 5
 
 @export var sim_world_path: NodePath
 var sim_world: Node
+var main: Node # StressTest is always a direct child of Main - see main.gd's own get_node_or_null("StressTest") symmetric lookup
 
 var measuring := false
 var elapsed := 0.0
@@ -78,7 +94,6 @@ var fps_samples: Array = []
 var frame_time_samples: Array = [] # ms, raw per-frame delta - not the smoothed Engine.get_frames_per_second() value
 var sim_ms_samples: Array = []
 var zero_active_streak := 0
-var passes_completed := 0
 var peak_active_chunks := 0
 var settled := false
 var timed_out := false
@@ -90,6 +105,19 @@ var active_chunks_before_spawn := -1
 var test_valid := true
 var history: Array[Dictionary] = [] # completed tier results, for the summary table
 
+# Physics-clock snapshots (see class doc comment "RENDER FPS != PHYSICS
+# SPEED") - main.cpu_backend's counters are monotonic for the whole scene
+# lifetime, not per-tier, so this script snapshots them at tier start and
+# reports the delta. Under genuine isolation (test_valid == true) this delta
+# equals the raw counter (fresh scene -> backend starts at 0 anyway), but
+# snapshotting is still the correct approach rather than relying on that -
+# see the "no fake reset" isolation philosophy in PERFORMANCE_SCALABILITY.md
+# "Stress Test Isolation".
+var _tick_count_at_start := 0
+var _simulation_time_at_start := 0.0
+var _passes_completed_at_start := 0
+var peak_backlog_ticks := 0 # sampled max during measurement - NOT a delta of cpu_backend's own cumulative max (see _process())
+
 # V-Sync/FPS-cap override state - captured in _start_test(), restored in
 # _finish_report(), so a benchmark run never leaves normal gameplay's
 # presentation settings changed. -1 means "no test has overridden it yet".
@@ -98,6 +126,7 @@ var original_max_fps: int = -1
 
 func _ready() -> void:
 	sim_world = get_node(sim_world_path)
+	main = get_parent()
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and event.shift_pressed and TIERS.has(event.keycode):
@@ -166,12 +195,17 @@ func _start_test(cell_count: int) -> void:
 	frame_time_samples.clear()
 	sim_ms_samples.clear()
 	zero_active_streak = 0
-	passes_completed = 0
 	peak_active_chunks = 0
+	peak_backlog_ticks = 0
 	settled = false
 	timed_out = false
 	settle_wall_seconds = 0.0
 	last_report = ""
+
+	# Physics-clock snapshot - see the field doc comment above.
+	_tick_count_at_start = main.cpu_backend.tick_count
+	_simulation_time_at_start = main.cpu_backend.simulation_time
+	_passes_completed_at_start = main.cpu_backend.passes_completed
 	print("[StressTest] spawned %d SAND cells, measuring wall-clock time to fully settle (safety timeout %.0fs)..." % [placed, MAX_TEST_DURATION])
 
 func _process(delta: float) -> void:
@@ -185,11 +219,19 @@ func _process(delta: float) -> void:
 	var stats: Dictionary = sim_world.get_stats()
 	var sim_ms: float = stats.get("sim_ms", 0.0)
 	sim_ms_samples.append(sim_ms)
-	if stats.get("pass_completed", false):
-		passes_completed += 1
 	var active_chunks: int = stats.get("active_chunks", 0)
 	if active_chunks > peak_active_chunks:
 		peak_active_chunks = active_chunks
+
+	# Backlog is sampled here (current value, own running max) rather than
+	# read from main.cpu_backend.max_backlog_ticks_seen directly, because
+	# that field is cumulative for the backend's whole lifetime - a delta
+	# against it would be wrong (see the peak_backlog_ticks field doc
+	# comment: subtracting two running-max snapshots does not recover the
+	# max seen strictly between them).
+	var current_backlog: int = main.cpu_backend.backlog_ticks
+	if current_backlog > peak_backlog_ticks:
+		peak_backlog_ticks = current_backlog
 
 	if active_chunks == 0:
 		zero_active_streak += 1
@@ -257,15 +299,14 @@ func _finish_report() -> void:
 
 	var result_word := "SETTLED" if settled else "TIMEOUT (did not settle within %.0fs - possible stuck simulation)" % MAX_TEST_DURATION
 
-	# "Physical simulation time" (seconds, independent of wall-clock/FPS) is
-	# only a defined quantity for the fixed-timestep GPU backend (Phase 2C,
-	# SIMULATION_TIMESCALE.md) - the CPU production path this test actually
-	# exercises has no fixed_dt/tick concept (confirmed directly in
-	# GPU_GAMEPLAY_INTEGRATION_AUDIT.md: PixelSimWorld::step_simulation()
-	# never uses its own `delta` parameter). `passes_completed` is reported
-	# instead, as the CPU path's own natural unit of physical progress (one
-	# full bottom-to-top sweep - see PROJECT_ARCHITECTURE.md §7), NOT
-	# converted into a fake "seconds" number.
+	# Physical simulation clock (see class doc comment "RENDER FPS != PHYSICS
+	# SPEED") - read from main.cpu_backend, the fixed-timestep accumulator
+	# that now gates every step_simulation() call. Deltas against the
+	# _start_test() snapshot isolate just this tier's contribution.
+	var physics_tick_count: int = main.cpu_backend.tick_count - _tick_count_at_start
+	var physical_simulation_time: float = main.cpu_backend.simulation_time - _simulation_time_at_start
+	var passes_completed: int = main.cpu_backend.passes_completed - _passes_completed_at_start
+
 	var validity_note := ""
 	if not test_valid:
 		validity_note = "\n** WARNING: TEST INVALID - started with active_chunks=%d (not 0). This scene carries state from a previous test; result is not valid for cross-tier comparison. **" % active_chunks_before_spawn
@@ -273,8 +314,8 @@ func _finish_report() -> void:
 	if not vsync_still_off:
 		vsync_note = "\n** WARNING: V-Sync was re-enabled mid-test (not by this script) - FPS/frame-time numbers above may be display-refresh-capped. **"
 
-	last_report = "Stress test result (%d SAND cells):\nResult: %s\nTime to settle (wall-clock): %.2f sec\nCPU passes completed: %d (no fixed-timestep physical-time unit on this path - see GPU_GAMEPLAY_INTEGRATION_AUDIT.md)\navg FPS=%.1f  min FPS=%.1f  max FPS=%.1f\navg frame=%.3fms  max frame=%.3fms  p95 frame=%.3fms  p99 frame=%.3fms\navg sim=%.3fms  max sim=%.3fms\npeak active chunks=%d/1344%s%s" % [
-		last_cell_count, result_word, settle_wall_seconds, passes_completed, avg_fps, min_fps, max_fps, avg_frame_ms, max_frame_ms, p95_frame_ms, p99_frame_ms, avg_sim, max_sim, peak_active_chunks, validity_note, vsync_note
+	last_report = "Stress test result (%d SAND cells):\nResult: %s\nTime to settle (wall-clock): %.2f sec\nPhysical simulation time: %.2f sec (%d fixed-timestep ticks @ %.4fs each)\nCPU passes completed: %d\navg FPS=%.1f  min FPS=%.1f  max FPS=%.1f\navg frame=%.3fms  max frame=%.3fms  p95 frame=%.3fms  p99 frame=%.3fms\navg sim=%.3fms  max sim=%.3fms\npeak active chunks=%d/1344  peak backlog=%d ticks%s%s" % [
+		last_cell_count, result_word, settle_wall_seconds, physical_simulation_time, physics_tick_count, main.cpu_backend.fixed_dt, passes_completed, avg_fps, min_fps, max_fps, avg_frame_ms, max_frame_ms, p95_frame_ms, p99_frame_ms, avg_sim, max_sim, peak_active_chunks, peak_backlog_ticks, validity_note, vsync_note
 	]
 	print("[StressTest] " + last_report.replace("\n", " | "))
 
@@ -285,7 +326,8 @@ func _finish_report() -> void:
 	print("Test Valid: %s" % ("YES" if test_valid else "NO"))
 	print("Fresh Scene: %s" % ("YES" if test_valid else "NO"))
 	print("V-Sync: %s" % ("OFF" if vsync_still_off else "RE-ENABLED (unexpected)"))
-	print("Physical simulation time: N/A on this path (no fixed-timestep concept - CPU passes completed: %d)" % passes_completed)
+	print("Physical simulation time: %.2f sec" % physical_simulation_time)
+	print("Physics ticks: %d" % physics_tick_count)
 	print("Average FPS: %.1f" % avg_fps)
 	print("Minimum FPS: %.1f" % min_fps)
 	print("Maximum FPS: %.1f" % max_fps)
@@ -296,6 +338,7 @@ func _finish_report() -> void:
 	print("Average simulation: %.3f ms" % avg_sim)
 	print("Maximum simulation: %.3f ms" % max_sim)
 	print("Peak active chunks: %d" % peak_active_chunks)
+	print("Peak backlog: %d ticks" % peak_backlog_ticks)
 
 	history.append({
 		"cell_count": last_cell_count,
@@ -304,7 +347,10 @@ func _finish_report() -> void:
 		"test_valid": test_valid,
 		"vsync_off": vsync_still_off,
 		"settle_wall_seconds": settle_wall_seconds,
+		"physical_simulation_time": physical_simulation_time,
+		"physics_tick_count": physics_tick_count,
 		"passes_completed": passes_completed,
+		"peak_backlog_ticks": peak_backlog_ticks,
 		"avg_fps": avg_fps,
 		"min_fps": min_fps,
 		"max_fps": max_fps,
@@ -339,15 +385,17 @@ func get_summary_table() -> String:
 	if history.is_empty():
 		return ""
 	var lines: Array[String] = []
-	lines.append("| Sand | Fresh Scene | V-Sync | Settled | Time to settle | Avg FPS | Min FPS | Max FPS | Avg Frame ms | Max Frame ms | Avg Sim ms | Peak Active |")
-	lines.append("|---:|:---:|:---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+	lines.append("| Sand | Fresh Scene | V-Sync | Settled | Time to settle | Physical sim time | Ticks | Avg FPS | Min FPS | Max FPS | Avg Frame ms | Max Frame ms | Avg Sim ms | Peak Active | Peak Backlog |")
+	lines.append("|---:|:---:|:---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 	for h in history:
 		var settled_word := "yes" if h["settled"] else "TIMEOUT"
 		var fresh_word := "yes" if h["test_valid"] else "NO (INVALID)"
 		var vsync_word := "OFF" if h.get("vsync_off", false) else "ON (unexpected)"
-		lines.append("| %s | %s | %s | %s | %.2fs | %.1f | %.1f | %.1f | %.3f | %.3f | %.3f | %d |" % [
+		lines.append("| %s | %s | %s | %s | %.2fs | %.2fs | %d | %.1f | %.1f | %.1f | %.3f | %.3f | %.3f | %d | %d |" % [
 			_fmt_count(h["cell_count"]), fresh_word, vsync_word, settled_word, h["settle_wall_seconds"],
-			h["avg_fps"], h["min_fps"], h["max_fps"], h["avg_frame_ms"], h["max_frame_ms"], h["avg_sim_ms"], h["peak_active_chunks"]
+			h.get("physical_simulation_time", 0.0), h.get("physics_tick_count", 0),
+			h["avg_fps"], h["min_fps"], h["max_fps"], h["avg_frame_ms"], h["max_frame_ms"], h["avg_sim_ms"],
+			h["peak_active_chunks"], h.get("peak_backlog_ticks", 0)
 		])
 	return "\n".join(lines)
 

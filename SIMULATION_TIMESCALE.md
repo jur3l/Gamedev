@@ -288,10 +288,73 @@ No device loss, no validation errors, no dispatch failures, across 1,500 total c
 
 ---
 
+## CPU Fixed Timestep (Production)
+
+**Status: CURRENT / IMPLEMENTED.** A later, separately-scoped fix (stress-test FPS-independence investigation) — **not** the "future production wiring of this [GPU] PoC" flagged as out-of-scope below (see [How Future Work Should Use This Document](#how-future-work-should-use-this-document) point 3). This section applies the *same fixed-timestep-accumulator pattern* documented above to the **CPU reference path** instead of the GPU PoC — the GPU backend's own production-wiring status is completely unchanged by this work (still not wired into `Main.tscn`/`main.gd`/any gameplay path).
+
+### RENDER FPS ≠ PHYSICS SPEED
+
+**ARCHITECTURAL INVARIANT**, now enforced on the actual gameplay path, not just the GPU PoC: physical simulation speed must never depend on render frame rate. Concretely: `main.gd`'s `_process(delta)` used to call `sim_world.step_simulation(delta)` **once per render frame, unconditionally** — and since `step_simulation()` → `World::step()` is itself a real-wall-clock-time-budgeted call (`simulation_budget_ms`, bounded by `std::chrono::steady_clock`, not simulated time), calling it more often (higher render FPS) meant strictly more real CPU scanning time — and therefore more physical progress — happened per real second. This was the exact bug [Current CPU Model](#current-cpu-model) above already diagnosed for the GPU PoC's own motivation, but it had never been fixed on the CPU path itself, since Phase 2C's accumulator was deliberately scoped to the GPU PoC only (see [Architectural Invariants](#architectural-invariants) below). It was reconfirmed directly and empirically during the stress-test benchmark work: the 10k tier's time-to-settle dropped from 3.10s at ~240 FPS (V-Sync capped) to 1.39s uncapped (~337 FPS avg) with **zero simulation code changed** — proof render FPS, not physics, was setting the pace (see PERFORMANCE_SCALABILITY.md "Stress Test Benchmark Mode").
+
+### The fix — `CPUSimulationBackend`
+
+`project/scripts/cpu_simulation_backend.gd` — a new, standalone `RefCounted` class, structurally identical to `GPUSimulationBackend`'s own accumulator loop (same shape as the pseudocode in [Accumulator](#accumulator) above), but gating calls to the **unmodified, existing** `PixelSimWorld.step_simulation()` instead of `GPUSandPoC.step()`. Zero C++ files touched — `World::step()`/`PixelSimWorld` are byte-for-byte unchanged; the fix lives entirely in a new GDScript orchestration layer, exactly the same non-invasive pattern Phase 2C already established for the GPU side.
+
+```
+accumulator += real_delta
+ticks_this_frame = 0
+while accumulator >= fixed_dt and ticks_this_frame < max_ticks_per_frame:
+    sim_world.step_simulation(fixed_dt)   # unmodified PixelSimWorld call
+    accumulator -= fixed_dt
+    ticks_this_frame += 1
+    tick_count += 1
+    simulation_time += fixed_dt
+backlog_ticks = floor(accumulator / fixed_dt)
+```
+
+**Fixed timestep used: `fixed_dt = 1/60 s`** — reused directly from `GPUSimulationBackend.DEFAULT_FIXED_DT` (this document's own [Fixed Timestep](#fixed-timestep) section above), not reinvented. **`max_ticks_per_frame = 10`** — same backlog-cap convention as the GPU backend.
+
+`main.gd`'s `_ready()` now constructs `cpu_backend = CPUSimulationBackend.new(sim_world)`, and `_process(delta)` calls `cpu_backend.advance(delta)` instead of `sim_world.step_simulation(delta)` directly. `stress_test.gd` reads `main.cpu_backend`'s own counters (`tick_count`, `simulation_time`, `passes_completed`, `backlog_ticks`) rather than resampling `sim_world.get_stats()` every render frame for edge-triggered events — necessary because, post-fix, `step_simulation()` no longer fires every frame (only when the accumulator has a full `fixed_dt` available), so a naive per-frame `stats.get("pass_completed")` read would double-count a still-`true` flag on frames where no new tick actually ran.
+
+### Interaction with `simulation_budget_ms`
+
+**Unchanged, and still doing exactly what it always did — bounding real CPU time per `step_simulation()` call, nothing more.** The two settings compose, not conflict:
+- The accumulator decides **how often** `step_simulation()` is called — now capped at ~60 calls/sec regardless of render FPS (previously: once per frame, i.e. render-FPS calls/sec).
+- `simulation_budget_ms` (4.0 ms, unchanged) still decides **how much a single call may do** before yielding — `World::step()`'s resumable row-scan/budget/`resume_y_` behavior is completely untouched.
+
+Worst-case CPU time spent on simulation is now bounded at **~60 × 4 ms = 240 ms of real time per real second**, regardless of render FPS — previously this scaled linearly with render FPS with no ceiling (500 FPS could reach ~2000 ms/s of budgeted scanning, i.e. simulation could consume essentially the entire frame budget). This is the concrete mechanism behind the fix, not just its intent.
+
+### Determinism
+
+PROJECT_ARCHITECTURE.md §7 already documented, as a design expectation, that `simulation_budget_ms` "changes how many rows get processed per `step()` call, but not the order or outcome of any given row" — i.e. slicing the same cumulative work across more-or-fewer, larger-or-smaller calls shouldn't change what the simulation computes, only how many real-time call boundaries it's spread across. That document flagged this as **not formally tested**. It now has been — see [FPS Independence](#fps-independence-cpu) below.
+
+### FPS Independence (CPU) {#fps-independence-cpu}
+
+`project/scripts/cpu_fps_independence_test.gd` — a standalone validation harness (mirrors `gpu_timestep_benchmark.gd`'s own `measure_fps_independence()`, applied to the CPU path). Builds an identical small world + seed + SAND scenario, drives it through `CPUSimulationBackend` at four **controlled, synthetic** render cadences (constant `delta = 1/cadence` per call — deliberately never tied to this machine's actual display refresh rate, per the request's explicit instruction), and compares tick count and full-grid physical state at matching physical simulation time (1.0s and 2.0s checkpoints).
+
+**Measured result:**
+
+| Render FPS (synthetic) | Physics ticks/sec | Physical state @ 1s | Physical state @ 2s |
+|---:|---:|---|---|
+| 60 | 60 | IDENTICAL to base | IDENTICAL to base |
+| 120 | 60 | IDENTICAL to base | IDENTICAL to base |
+| 240 | 60 | IDENTICAL to base | IDENTICAL to base |
+| 500 | 60 | IDENTICAL to base | IDENTICAL to base |
+
+All four cadences produced **exactly 60 ticks/sec** and **byte-exact identical full-grid state** at both checkpoints (`PackedInt32Array ==` over every cell, all 4 cadences vs. the 60 FPS baseline) — a stronger result than the conservative fallback the request explicitly allowed for ("if exact equality isn't guaranteed by the architecture, measure physical invariants instead"). SAND mass was also confirmed conserved identically across all four runs. This directly confirms PROJECT_ARCHITECTURE.md §7's determinism claim for this specific scenario: the CPU reference path's outcome depends only on cumulative tick count, never on how those ticks were distributed across render frames.
+
+**Live-gameplay confirmation** (not just the isolated harness above): running the actual `Main` scene and sampling `main.cpu_backend.tick_count`/`simulation_time` across a controlled real-time interval showed the tick rate tracking genuine elapsed wall-clock time at exactly ~60 ticks/sec with `backlog_ticks == 0` throughout, including through mining and SAND-drop interactions — see PERFORMANCE_SCALABILITY.md's stress-test results for the full 10k–500k re-measurement under this architecture.
+
+### What changed for existing stress-test numbers
+
+Every "Time to settle" number recorded before this fix (all of PERFORMANCE_SCALABILITY.md's stress-test tables prior to this section) was measured under the render-FPS-coupled bug — meaning uncapping V-Sync/FPS in the immediately preceding milestone made the *benchmark* more accurate at exposing the render/frame ceiling, but also made the underlying *physics* run measurably faster in wall-clock terms than its true, correctly-paced rate (since more real FPS meant more `step_simulation()` calls meant more real progress per second). Post-fix, wall-clock "Time to settle" and physical "simulation time" converge to the same number (`backlog_ticks` stayed at 0 for every tier in the re-measurement — the accumulator never needed to catch up), and both are now properly decoupled from however fast this machine can render. See PERFORMANCE_SCALABILITY.md "Stress Test — Fixed-Timestep Physics" for the re-measured table.
+
+---
+
 ## Architectural Invariants
 
-- `fixed_dt`/`PHYSICAL_TICKS_PER_SECOND`/accumulator logic lives entirely in the new `GPUSimulationBackend` — it never touches `gpu_sand_poc.gd`, `gpu_cellular_solver.glsl`, `World`, `PixelSimWorld`, or any CPU solver.
-- `GPUSimulationBackend` is not wired into `Main.tscn`/`main.gd`/any production path — same experimental status as `GPUSandPoC` itself (PROJECT_ARCHITECTURE.md's "GPU PoC is EXPERIMENTAL, CPU stays PRODUCTION/REFERENCE" framing is unchanged by this phase).
+- `fixed_dt`/`PHYSICAL_TICKS_PER_SECOND`/accumulator logic for the **GPU** PoC lives entirely in `GPUSimulationBackend` — it never touches `gpu_sand_poc.gd`, `gpu_cellular_solver.glsl`, `World`, `PixelSimWorld`, or any CPU solver. (The analogous **CPU** accumulator, `CPUSimulationBackend` - see [CPU Fixed Timestep (Production)](#cpu-fixed-timestep-production) - is a separate class with the same pattern, added in a later milestone; the two are independent, non-overlapping wrappers around their respective backends.)
+- `GPUSimulationBackend` is still not wired into `Main.tscn`/`main.gd`/any production path — same experimental status as `GPUSandPoC` itself (PROJECT_ARCHITECTURE.md's "GPU PoC is EXPERIMENTAL, CPU stays PRODUCTION/REFERENCE" framing is unchanged by this phase). `CPUSimulationBackend` **is** wired into production (`main.gd`) - it wraps the CPU reference solver, not the GPU PoC, so this does not contradict the "GPU stays experimental" invariant.
 - `max_ticks_per_frame` is a hard cap, never bypassed — backlog is the honest overflow valve, not a larger cap.
 - No readback inside the accumulator's per-frame tick-execution path — readback is a separate, separately-measured, on-demand operation.
 - Scope stays SAND + WATER only, matching what the GPU shader already implements — no LAVA, no Material Reaction System, no GPU activation/sleeping, no GPU-native rendering (see [Prohibited This Phase](#prohibited-this-phase)).
