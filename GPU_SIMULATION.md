@@ -241,11 +241,11 @@ The single largest risk going in — whether `RenderingDevice`/compute shaders w
 
 **FUTURE / OPTIONAL — none of this is decided architecture, and none of it is implied scope.** Restated from the original request's own roadmap (§24), unchanged:
 
-- Phase 2B: liquid (WATER) solver.
-- Phase 2C: formal CPU/GPU validation harness (this PoC's validation was manual/scripted; a real one would be a repeatable automated test).
-- Phase 2D: Material Reaction System, data-driven (never hardcoded per-pair logic in a shader — same invariant as the CPU's `REACTION_TABLE`).
-- Phase 2E: activation/sleeping equivalent on GPU.
-- Phase 2F: GPU simulation → GPU rendering (removing the CPU readback from the production path entirely).
+- Phase 2B: liquid (WATER) solver. **Done.**
+- Phase 2C: originally scoped as "formal CPU/GPU validation harness" only. **Done, and expanded** — see [Phase 2C — Real-Time Timestep Integration](#phase-2c--real-time-timestep-integration): delivers the persisted validation harness this line originally asked for (`gpu_solver_tests.gd`, 12+16 tests) as part of a larger fixed-timestep/accumulator/GPU-integration milestone (SIMULATION_TIMESCALE.md).
+- Phase 2D: Material Reaction System, data-driven (never hardcoded per-pair logic in a shader — same invariant as the CPU's `REACTION_TABLE`). Not started.
+- Phase 2E: activation/sleeping equivalent on GPU. Not started — flagged by Phase 2C's own measurements as the thing that would actually need to exist before the measured real-time-ratio margin could be assumed at a world size larger than the one tested (see SIMULATION_TIMESCALE.md "Architecture Decision").
+- Phase 2F: GPU simulation → GPU rendering (removing the CPU readback from the production path entirely). Not started.
 - The chunk-storage architecture decision (flat buffer vs. tiled with neighbor/halo exchange) flagged above.
 - A tighter GPU state packing (e.g. `uint8` material with explicit bit-packing) if the 2.66× memory ratio becomes a real constraint at production scale.
 
@@ -387,6 +387,8 @@ The one real complication (the displacement-duplication bug) is exactly the kind
 
 **Recommended: Phase 2C — a formal, automated CPU/GPU validation harness**, per the original Phase 2A roadmap's own ordering (2B → 2C → 2D...). This phase's validation was still manual/scripted (as Phase 2A's was); with two materials now correctly interacting (including a real displacement bug this manual process still successfully caught), formalizing the no-contention-exact-match and contested-mass-conservation checks into a repeatable, automated test would materially derisk any further phase, especially once LAVA/reactions introduce a third and fourth material with their own displacement rules. **Per the original request's explicit instruction: this document stops here.** No LAVA, Material Reaction System, activation, or GPU rendering work has been started.
 
+**Update: Phase 2C is now done — see [Phase 2C — Real-Time Timestep Integration](#phase-2c--real-time-timestep-integration) below.** It turned out to be a different, newer initiative (fixed timestep + accumulator + GPU integration, driven by SIMULATION_TIMESCALE_INVESTIGATION.md) than the "formal validation harness" this section originally recommended — but delivers that too as a byproduct (see [Validation](#validation-1) below), so the roadmap's own "Phase 2C" slot is filled by one phase, not two. This "Next Step" text is kept as the original, historical recommendation, not rewritten in place, per this document's own established policy (see the equivalent note on Phase 2A's "Next Step" above).
+
 ---
 
 ## Architectural Invariants
@@ -416,3 +418,19 @@ Everything in PROJECT_ARCHITECTURE.md §13/§14 and PERFORMANCE_SCALABILITY.md's
 4. Keep the GO/NO-GO decision format for future phases — a real number, not a vibe.
 5. When adding a new displacement/conflict scenario, write the conservation test *before* trusting the result, the way Phase 2B's SAND-through-WATER test caught a real bug rather than a hypothetical one.
 6. If a future measurement contradicts a number here (different hardware, different Godot version, different workload shape), update the number and say what changed — don't silently average it away.
+
+---
+
+# Phase 2C — Real-Time Timestep Integration
+
+**Status: DONE — GO WITH CONDITIONS.** Full detail lives in its own document, [SIMULATION_TIMESCALE.md](SIMULATION_TIMESCALE.md) — this section is a brief, honest pointer, not a duplicate. Read SIMULATION_TIMESCALE.md for the complete design, measured tables, and decision.
+
+**What this phase actually was.** Not the "formal CPU/GPU validation harness" this document's own roadmap originally slotted into "Phase 2C" (see the "Update" note on Phase 2B's "Next Step" above) — a separate, newer initiative: a fixed-timestep + accumulator layer (`GPUSimulationBackend`, `project/scripts/gpu_simulation_backend.gd`) composed around the **unmodified** `GPUSandPoC`/`gpu_cellular_solver.glsl`, decoupling physical simulation time from CPU compute workload (the problem SIMULATION_TIMESCALE_INVESTIGATION.md identified: `PixelSimWorld::step_simulation(delta)` never used `delta`, so pass rate silently degraded up to 5.85× under load). It delivers the original validation-harness goal too, as a byproduct: `gpu_solver_tests.gd` persists Phase 2A/2B's 12+16 test scenarios as a real, re-runnable file for the first time (they previously existed only as one-off scripted runs).
+
+**No new GPU simulation infrastructure** — same invariant Phase 2B held for WATER. `GPUSimulationBackend` only decides *when* to call `GPUSandPoC.step()`; it contains zero cellular-automata logic of its own.
+
+**Headline result:** GPU sustains real-time physical cadence (`simulation_real_time_ratio`) at 70–76× margin across 10k–500k SAND — buffer-size-bound, not SAND-count-bound, a direct consequence of this PoC's already-documented "no GPU activation/sleeping" limitation (every dispatch evaluates the whole buffer, always). CPU-vs-GPU wall time for an equivalent 60-tick/60-call unit widens from ~3.5× to ~16× GPU advantage across the same tiers. Accumulator/backlog mechanism validated correct (never engages its safety cap at these workloads). FPS independence confirmed byte-identical across 30/60/120fps when compared by tick count. A real GPU-process-crashing stability issue was reproduced and fixed within this phase (rapid repeated `RenderingDevice` creation, not dispatch volume — see SIMULATION_TIMESCALE.md "GPU Stability").
+
+**Still not done, same as every prior phase:** no LAVA, no Material Reaction System, no GPU activation/sleeping, no GPU rendering, no production wiring into `PixelSimWorld`/`Main.tscn`. See SIMULATION_TIMESCALE.md "Architecture Decision" for the specific conditions attached to the GO.
+
+**New files this phase, all GDScript, zero C++ changed** (same "zero C++ files changed" invariant every phase in this document has held): `project/scripts/gpu_simulation_backend.gd`, `project/scripts/gpu_solver_tests.gd`, `project/scripts/gpu_timestep_benchmark.gd`.

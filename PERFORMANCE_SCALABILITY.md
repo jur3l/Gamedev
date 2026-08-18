@@ -424,6 +424,28 @@ The FPS difference is uniform across every workload tier (not scaling with simul
 
 ---
 
+## Phase 2C — Real-Time Timestep Integration
+
+**Status: DONE — GO WITH CONDITIONS.** Full detail lives in **[SIMULATION_TIMESCALE.md](SIMULATION_TIMESCALE.md)** and **[GPU_SIMULATION.md "Phase 2C"](GPU_SIMULATION.md#phase-2c--real-time-timestep-integration)** — this is a scalability-focused summary.
+
+**What this measures that Phase 2A/2B didn't:** those phases benchmarked raw GPU compute cost by *chunk count* (1–1,000 chunks, an abstract test grid). Phase 2C benchmarks the same 10k/50k/100k/250k/500k SAND tiers `stress_test.gd` already uses, at the *actual default world size* (3072×1792 cells), so GPU and CPU numbers are directly comparable at the exact scale this project's own stress harness already establishes as meaningful.
+
+**Headline scalability result:**
+
+| SAND cells | CPU wall time (60 `step_simulation` calls) | GPU wall time (60 ticks) | GPU `simulation_real_time_ratio` |
+|---:|---:|---:|---:|
+| 10,000 | 0.049 s | 0.014 s | 71.4 |
+| 50,000 | 0.157 s | 0.013 s | 76.4 |
+| 100,000 | 0.143 s | 0.014 s | 72.9 |
+| 250,000 | 0.231 s | 0.013 s | 74.6 |
+| 500,000 | 0.228 s | 0.014 s | 70.4 |
+
+**CPU wall time grows 4.7× across this range (tracking active-chunk-count-driven `sim_ms` growth, exactly this document's own §"Simulation Scaling" story). GPU wall time is flat** — because GPU dispatch cost here is bound by *world buffer size* (fixed for every tier), not by SAND cell count, a direct consequence of this project's own already-documented "no GPU activation/sleeping" limitation. This is the same bottleneck-ranking item already tracked in this document's own "Bottlenecks" section ("idle simulation cost scales linearly with total chunk count") viewed from the opposite direction: on GPU, cost is *world-size*-bound rather than *activity*-bound, which is a strength at every SAND/WATER count tested here and a named, deliberately out-of-scope risk at world sizes this phase did not test (see SIMULATION_TIMESCALE.md "Architecture Decision").
+
+**Decision: GO WITH CONDITIONS.** Mechanism validated (fixed timestep, accumulator, backlog, FPS independence all correct); production wiring, world-size scaling beyond the tested range, and the rest of the CPU ruleset (LAVA, reactions, mining, activation, Background/Foreground) remain explicitly out of scope — see SIMULATION_TIMESCALE.md for the full condition list.
+
+---
+
 ## Correctness Verification
 
 Verified live, pixel-for-pixel against C++ ground truth, before considering the optimization complete:
