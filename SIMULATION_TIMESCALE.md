@@ -351,6 +351,41 @@ Every "Time to settle" number recorded before this fix (all of PERFORMANCE_SCALA
 
 ---
 
+## Stress-Test Instrumentation Trustworthiness (Frame-Time / Stutter / Per-Tick Timing)
+
+**Status: CURRENT / IMPLEMENTED. Instrumentation only — no new 10k-500k benchmark numbers were produced by this section; see the closing note below.**
+
+### The report that triggered this section
+
+The fixed-timestep fix above (previous section) reported avg FPS of ~2100 at the 10k tier down to ~1127 at the 500k tier — read superficially, an excellent result. Manually playing the 500k tier, however, visibly and repeatedly stutters. **A benchmark number that contradicts direct human observation cannot be trusted as-is** — this section exists to find out *why* the two disagreed, not to argue the FPS number was "basically fine."
+
+### Root cause: two separate measurement gaps, not a physics bug
+
+Neither gap is in `CPUSimulationBackend`'s accumulator itself (that mechanism's own correctness - fixed `fixed_dt`, `backlog_ticks == 0` throughout, byte-exact FPS-independence - is unaffected and re-confirmed below). Both are in what the *stress-test harness* sampled and reported:
+
+1. **`Engine.get_frames_per_second()` is itself a smoothed, rolling-average counter** (Godot's own internal ~1-second smoothing window). `stress_test.gd`'s old code sampled this already-smoothed value once per render frame and then averaged *those samples* - smoothing an average of an average. A handful of genuine multi-frame stalls can sit inside that internal smoothing window without ever moving the reported number much, while still being fully visible to a human as a stutter. This is a measurement-methodology gap, not a claim that the counter itself is "wrong" for what it's designed to do (a rough on-screen FPS readout).
+2. **`sim_ms` was resampled every render frame from `PixelSimWorld.get_stats()`**, a value that only changes when `step_simulation()` actually runs. Once render FPS decouples from the ~60 tick/s physics rate (exactly what the previous section's fix achieves), most render frames execute **zero** simulation ticks - on those frames, the old per-frame sample just reread the previous tick's stale cached `sim_ms`, which stopped being a meaningful per-frame (or per-tick) cost signal the moment the two rates diverged this far apart (1000+ FPS vs. 60 ticks/sec).
+
+### The fix
+
+**Per-tick wall-clock timing, not per-frame stats resampling.** `CPUSimulationBackend.advance()` now times each `step_simulation()` call directly with `Time.get_ticks_usec()`, immediately around the call - a sample always corresponds to a tick that actually ran. `last_advance_tick_usec`/`last_advance_ticks` (this frame's own tick timing) are always maintained, at negligible cost (a couple of `Time.get_ticks_usec()` calls per tick, no array growth); the full per-tick history needed for percentiles (`tick_duration_samples`) is gated behind `record_tick_samples` (default `false` - zero cost/growth in ordinary, non-benchmark gameplay), which `stress_test.gd` turns on only for the duration of a measured tier and off again once the tier's report is generated.
+
+**Frame time derived from raw `delta`, not the smoothed engine counter.** `stress_test.gd` no longer calls `Engine.get_frames_per_second()` at all during measurement. Each frame's own `delta` is the source of truth for both frame-time-in-ms and an instantaneous `fps = 1.0 / delta` sample. The report's primary render-performance signal is now the **frame-time distribution** (average, median, p95, p99, max) plus explicit **stutter-frame counts** - frames slower than 16.67ms / 33.33ms / 50ms (60/30/20fps-equivalent thresholds) - not a single average. Average FPS/frame-time are still reported (useful, familiar numbers), but are explicitly documented as secondary to the distribution, per the same principle PERFORMANCE_SCALABILITY.md's "Stress Test Benchmark Mode" section already established for V-Sync-capped averages hiding a real ceiling - a smoothed or averaged number can hide exactly the thing a stutter *is*.
+
+**Frame-vs-simulation split.** Because `last_advance_tick_usec` is available to any caller running after `Main._process()` in the same frame (`stress_test.gd`'s `_process()` does, since `StressTest` is a child of `Main`), the report can show "how much of an average frame's cost was simulation" (`avg frame-sim-time`) vs. everything else (`avg frame remainder`) - letting a stutter be attributed to "simulation-bound" or "something else" (rendering, engine/editor overhead) instead of guessed at.
+
+**Zero simulation/gameplay/timestep code changed.** This is purely a measurement/reporting layer added on top of the unmodified accumulator from the previous section - `fixed_dt`, `max_ticks_per_frame`, gravity, the SAND solver, `simulation_budget_ms`, and `World::step()` are all byte-for-byte identical to before this section.
+
+### Regression check
+
+`CPUFPSIndependenceTest.run()` (`project/scripts/cpu_fps_independence_test.gd`) was re-run live, after the above instrumentation was added, exactly as in [FPS Independence (CPU)](#fps-independence-cpu) above: still **byte-exact identical grid state** across 60/120/240/500 synthetic render cadences, still exactly 60 ticks/sec at every cadence, SAND mass still conserved identically across all four runs. This confirms the new per-tick timing calls add no observable side effect to the accumulator they instrument. This is a correctness/determinism check, not a stress-tier benchmark - no 10k-500k tier was run to produce this confirmation.
+
+### What this section does not answer yet
+
+**Why the specific reported ~1127 avg FPS at 500k coexisted with visible stutter** - the actual frame-time distribution, stutter-frame counts, and simulation-tick timing for the 10k-500k tiers, measured with this new instrumentation. That requires running the harness, which per the request that scoped this section is a **human-run, human-observed** pass (Shift+1..5, one fresh scene per tier - see PERFORMANCE_SCALABILITY.md "How to Run the Stress Test Manually"), not something generated automatically here. This document and PERFORMANCE_SCALABILITY.md will be updated with the real measured numbers once that pass is reported back - until then, no 10k-500k table exists for this instrumentation, by design, not by oversight.
+
+---
+
 ## Architectural Invariants
 
 - `fixed_dt`/`PHYSICAL_TICKS_PER_SECOND`/accumulator logic for the **GPU** PoC lives entirely in `GPUSimulationBackend` — it never touches `gpu_sand_poc.gd`, `gpu_cellular_solver.glsl`, `World`, `PixelSimWorld`, or any CPU solver. (The analogous **CPU** accumulator, `CPUSimulationBackend` - see [CPU Fixed Timestep (Production)](#cpu-fixed-timestep-production) - is a separate class with the same pattern, added in a later milestone; the two are independent, non-overlapping wrappers around their respective backends.)
@@ -372,3 +407,5 @@ Per the request's explicit scope boundaries — none of the following are touche
 2. `GPUSimulationBackend` is the only sanctioned place for timestep/accumulator/backlog logic — do not duplicate this pattern elsewhere.
 3. Any future production wiring of this PoC into `PixelSimWorld`/`Main.tscn` is a separate, deliberately-scoped milestone (per SIMULATION_TIMESCALE_INVESTIGATION.md's own risk list: CPU/GPU divergence for the *entire* ruleset, not just SAND/WATER, and a decision on how gameplay code accesses GPU-resident state) — not an implied next step of this document.
 4. If a future measurement contradicts a number here, update the number and say what changed — the same policy PERFORMANCE_SCALABILITY.md and GPU_SIMULATION.md already follow.
+5. `CPUSimulationBackend.record_tick_samples`/`tick_duration_samples` (see [Stress-Test Instrumentation Trustworthiness](#stress-test-instrumentation-trustworthiness-frame-time--stutter--per-tick-timing)) is the only sanctioned place for per-tick wall-clock timing on the CPU path — do not add a second, competing timing mechanism; extend `stress_test.gd`'s consumption of it instead.
+6. Never trust a single averaged FPS/frame-time number as proof of smooth gameplay, on either the CPU or GPU path — always check the frame-time distribution (median/p95/p99/max) and stutter-frame counts alongside it, per the same reasoning that motivated this section.

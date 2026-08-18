@@ -46,6 +46,26 @@ extends RefCounted
 ## how many real-time call boundaries it's spread across. This is what makes
 ## capping call *frequency* here a correct, non-invasive fix rather than a
 ## simulation-logic change.
+##
+## Per-tick wall-clock instrumentation (see PERFORMANCE_SCALABILITY.md
+## "Frame-Time / Stutter Instrumentation"): `sim_ms` from
+## PixelSimWorld.get_stats() is a CPU-internal-only figure (time spent inside
+## World::step()'s own budgeted row scan) and, worse, once render FPS
+## decouples from the ~60 tick/s physics rate, most render frames run ZERO
+## ticks - a naive per-render-frame sampling of get_stats() would just
+## re-read the same stale cached value on every one of those frames, which is
+## not a meaningful "simulation cost" sample. This class instead times each
+## step_simulation() call directly with Time.get_ticks_usec(), immediately
+## around the call, so a "simulation tick" sample always corresponds to an
+## actual tick that ran, never a resample of stale state.
+##
+## `last_advance_tick_usec`/`last_advance_ticks` are always maintained (cheap
+## - one Time.get_ticks_usec() pair per tick, no array growth) so any caller
+## running after this frame's advance() can read "how much of this frame's
+## budget was simulation" without opting into anything. `tick_duration_samples`
+## (the full per-tick history, needed for percentiles) is gated behind
+## `record_tick_samples` (default false, zero cost/growth in normal gameplay)
+## - stress_test.gd turns it on only for the duration of a measured tier.
 
 const DEFAULT_FIXED_DT := 1.0 / 60.0       # matches GPUSimulationBackend.DEFAULT_FIXED_DT - reused, not reinvented
 const DEFAULT_MAX_TICKS_PER_FRAME := 10    # matches GPUSimulationBackend.DEFAULT_MAX_TICKS_PER_FRAME - same backlog-cap convention
@@ -68,6 +88,12 @@ var passes_completed := 0    # incremented only for ticks that ACTUALLY ran and 
 
 var last_stats: Dictionary = {}
 
+# --- Per-tick wall-clock instrumentation (see class doc comment above) ---
+var last_advance_tick_usec := 0   # sum of THIS advance() call's own step_simulation() wall time - always maintained, cheap
+var last_advance_ticks := 0       # ticks that actually ran in the most recent advance() call
+var record_tick_samples := false  # opt-in - stress_test.gd only, off by default so normal gameplay never grows this array
+var tick_duration_samples: Array[float] = []  # ms per tick, only appended while record_tick_samples is true
+
 func _init(p_sim_world: Object) -> void:
 	sim_world = p_sim_world
 
@@ -79,14 +105,21 @@ func _init(p_sim_world: Object) -> void:
 func advance(real_delta: float) -> Dictionary:
 	accumulator += real_delta
 	var ticks_this_frame := 0
+	last_advance_tick_usec = 0
 	while accumulator >= fixed_dt and ticks_this_frame < max_ticks_per_frame:
 		accumulator -= fixed_dt
+		var tick_start_usec := Time.get_ticks_usec()
 		var stats: Dictionary = sim_world.step_simulation(fixed_dt)
+		var tick_usec := Time.get_ticks_usec() - tick_start_usec
+		last_advance_tick_usec += tick_usec
+		if record_tick_samples:
+			tick_duration_samples.append(tick_usec / 1000.0)
 		last_stats = stats
 		if stats.get("pass_completed", false):
 			passes_completed += 1
 		ticks_this_frame += 1
 		tick_count += 1
+	last_advance_ticks = ticks_this_frame
 
 	if ticks_this_frame > 0:
 		simulation_time += ticks_this_frame * fixed_dt
@@ -120,3 +153,6 @@ func reset_clock() -> void:
 	max_backlog_ticks_seen = 0
 	passes_completed = 0
 	last_stats = {}
+	last_advance_tick_usec = 0
+	last_advance_ticks = 0
+	tick_duration_samples.clear()
