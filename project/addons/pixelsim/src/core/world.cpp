@@ -221,8 +221,10 @@ StepStats World::step(double simulation_budget_ms) {
                 }
 
                 bool moved = false;
-                if (!reacted && !externally_owned_movement_[static_cast<int>(mat)]) {
-                    if (def.behavior == MovementBehavior::POWDER) {
+                if (!reacted) {
+                    if (externally_owned_movement_[static_cast<int>(mat)]) {
+                        stats.movement_gated_skips++;
+                    } else if (def.behavior == MovementBehavior::POWDER) {
                         moved = solve_powder(*this, world_x, y);
                     } else if (def.behavior == MovementBehavior::LIQUID) {
                         moved = solve_liquid(*this, world_x, y);

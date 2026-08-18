@@ -665,6 +665,32 @@ The FPS difference is uniform across every workload tier (not scaling with simul
 
 ---
 
+## Phase 2F — Production Wiring (SAND+WATER movement)
+
+**Status: WIRING/CORRECTNESS DONE — PERFORMANCE REGRESSION FOUND AND ROOT-CAUSED, NOT FIXED.** Full detail in **[SIMULATION_TIMESCALE.md "GPU Production Wiring" / "Regression Investigation"](SIMULATION_TIMESCALE.md#regression-investigation--root-cause-analysis)** — this is a scalability-focused summary; do not read a "GO" out of this entry.
+
+**What changed:** GPU became reachable from actual gameplay (`Main.tscn`) for the first time, computing SAND+WATER movement while CPU/`PixelSimWorld` stays authoritative for everything else. Unlike every prior GPU phase in this document, this one required small additive C++ changes (`World::get_materials_rect`/`set_materials_rect`, a per-material movement-ownership gate) — not "zero C++ files changed."
+
+**Measured performance cost, live in the real game (not a synthetic benchmark):**
+
+| Stage | Avg cost per dispatched frame |
+|---|---:|
+| CPU→GPU translate (upload) | ~3.3-3.6 ms |
+| GPU `write_rect()` (upload, N=region-rows `buffer_update()` calls) | ~0.2 ms |
+| GPU dispatch (`step_region()` compute + `submit()` + `sync()`) | ~1.5-1.9 ms |
+| GPU `read_rect()` (download, N=region-rows `buffer_get_data()` calls) | **~35-38 ms** |
+| GPU→CPU translate (download) | ~3.0-3.4 ms |
+| CPU writeback (`set_materials_rect()`) | ~0.5 ms |
+| **Total `advance()` per dispatched frame** | **~47-54 ms** |
+
+For scale: a 60fps frame budget is 16.67ms — a single dispatched frame here costs **2.8-3.2× that entire budget**, synchronously, on the main thread, before rendering even runs. GPU compute itself is ~3-4% of this — consistent with Phase 2C's own 70×+ real-time-margin finding; the actual solver was never the bottleneck. The dominant cost (`read_rect()`, ~81% of the total) is architectural: one `RenderingDevice` API call per region row instead of one bulk call, multiplied by an active-region margin-sizing formula that inflates even a small, localized mining action to a ~320-384-cell-per-side region (~102k-123k cells) regardless of how much actually changed.
+
+**A methodology note this milestone reconfirms** (same one the Baseline table's own methodology note flagged originally): an average can hide a spike completely. Session-wide, averaging in ~21,000 near-zero-cost idle frames alongside 14 expensive dispatched ones produced a reassuring **~39-62 µs/frame** overall average — the real ~47-54ms spikes only became visible by isolating dispatched-frame samples specifically. See SIMULATION_TIMESCALE.md's full root-cause ranking (P0-P3) for the complete evidence, the production-path trace, and what was ruled out (CPU double-work, duplicate dispatch, runtime buffer reallocation, a physics/solver-timescale problem).
+
+**Not done in this phase:** no fix applied — gravity, fixed timestep, the solvers, and `simulation_budget_ms` were explicitly not touched while investigating the regression.
+
+---
+
 ## Correctness Verification
 
 Verified live, pixel-for-pixel against C++ ground truth, before considering the optimization complete:

@@ -1484,6 +1484,44 @@ static void test_movement_gate_suppresses_liquid_movement() {
 // solve_powder/solve_liquid call site) - reactions are a separate,
 // unconditional call earlier in step()'s per-cell logic and must keep
 // firing normally for a movement-gated material.
+// Regression investigation instrumentation (SIMULATION_TIMESCALE.md "GPU
+// Production Wiring: Regression Investigation") - StepStats::
+// movement_gated_skips exists to PROVE, not just structurally argue, that a
+// gated material's movement dispatch never runs.
+static void test_movement_gated_skips_counts_only_gated_movable_cells() {
+    std::printf("test_movement_gated_skips_counts_only_gated_movable_cells\n");
+
+    // Fresh world, nothing gated - a normal step should report zero gated
+    // skips (separate World instance so nothing has moved/left residue yet).
+    World ungated_world(1, 1, 507);
+    ungated_world.set_cell(5, 5, MaterialType::SAND);
+    ungated_world.set_cell(10, 5, MaterialType::WATER);
+    ungated_world.set_cell(15, 5, MaterialType::DIRT);
+    StepStats ungated = ungated_world.step(1000.0);
+    CHECK(ungated.movement_gated_skips == 0);
+
+    // Separate fresh world, gated BEFORE anything ever moves - avoids any
+    // leftover-cell confound from a prior step.
+    World world(1, 1, 508);
+    world.set_movement_externally_owned(MaterialType::SAND, true);
+    world.set_movement_externally_owned(MaterialType::WATER, true);
+    world.set_cell(5, 5, MaterialType::SAND);
+    world.set_cell(10, 5, MaterialType::WATER);
+    world.set_cell(15, 5, MaterialType::DIRT); // STATIC - never dispatched at all, gated or not
+
+    StepStats gated = world.step(1000.0);
+    // Exactly the SAND and WATER cells (2) should be counted as gated skips
+    // - the DIRT cell never reaches the gate check at all (STATIC behavior
+    // is filtered out earlier in step()'s per-cell loop).
+    CHECK(gated.movement_gated_skips == 2);
+    CHECK(gated.cells_moved == 0); // neither gated cell actually moved
+    CHECK(world.get_material(5, 5) == MaterialType::SAND);   // stayed put
+    CHECK(world.get_material(10, 5) == MaterialType::WATER); // stayed put
+
+    world.set_movement_externally_owned(MaterialType::SAND, false);
+    world.set_movement_externally_owned(MaterialType::WATER, false);
+}
+
 static void test_movement_gate_does_not_suppress_reactions() {
     std::printf("test_movement_gate_does_not_suppress_reactions\n");
     World world(1, 1, 506);
@@ -1585,6 +1623,7 @@ int main() {
     test_movement_gate_defaults_to_false_for_every_material();
     test_movement_gate_suppresses_powder_movement();
     test_movement_gate_suppresses_liquid_movement();
+    test_movement_gated_skips_counts_only_gated_movable_cells();
     test_movement_gate_does_not_suppress_reactions();
 
     std::printf("\n%d/%d checks passed\n", g_checks - g_failures, g_checks);

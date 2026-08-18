@@ -80,6 +80,37 @@ var available := false
 var _gpu_to_cpu: PackedInt32Array = [] # inverse of CPU_TO_GPU, size MAX_MATERIALS
 var _region := Rect2i() # cell-space active region, mirrors backend.region_rect
 
+# --- Per-stage timing instrumentation (regression investigation - see
+# SIMULATION_TIMESCALE.md "GPU Production Wiring: Regression Investigation").
+# Measurement only, added around the EXISTING calls in advance() below -
+# zero behavior/timing change to the pipeline itself, just Time.get_ticks_
+# usec() calls bracketing each stage so "where does the time actually go"
+# can be answered with evidence instead of assumed. All *_usec fields are
+# this-frame-only (0 on a frame that didn't dispatch); the total_* fields
+# accumulate across the whole session, same convention as
+# GPUSimulationBackend's own total_compute_usec/total_readback_usec.
+var last_region_w := 0
+var last_region_h := 0
+var last_dispatched := false
+var last_upload_translate_usec := 0  # CPU: get_materials_rect() result -> GPU ids (GDScript loop)
+var last_upload_write_usec := 0      # GPU: write_rect() - one buffer_update() RD call per region row
+var last_dispatch_usec := 0          # GPU: step_region() compute+submit+sync (see GPUSandPoC.last_compute_usec - the RD API does not expose compute-only vs. sync-wait separately, see doc note below)
+var last_download_read_usec := 0     # GPU: read_rect() - one buffer_get_data() RD call per region row
+var last_download_translate_usec := 0 # CPU: GPU ids -> PackedByteArray (GDScript loop)
+var last_cpu_writeback_usec := 0     # CPU: set_materials_rect() - per-cell get_material()+set_cell() in C++
+var last_advance_total_usec := 0     # wall time for the whole advance() call, this frame
+
+var total_upload_translate_usec := 0
+var total_upload_write_usec := 0
+var total_dispatch_usec := 0
+var total_download_read_usec := 0
+var total_download_translate_usec := 0
+var total_cpu_writeback_usec := 0
+var total_advance_usec := 0        # sum of last_advance_total_usec on DISPATCHED frames only - see avg_advance_total_usec
+var total_advance_usec_all_frames := 0 # sum across EVERY advance() call, dispatched or not - whole-session wall cost of this bridge existing at all, including idle-frame no-op overhead
+var dispatched_frame_count := 0 # frames where an actual GPU dispatch + full round-trip happened
+var total_frame_count := 0      # every advance() call, dispatched or not
+
 func _init(p_sim_world: Node, seed_value: int) -> void:
 	sim_world = p_sim_world
 	_build_gpu_to_cpu_table()
@@ -136,28 +167,103 @@ func advance(real_delta: float) -> Dictionary:
 	if not available:
 		return {}
 
+	var t_advance_start := Time.get_ticks_usec()
+	last_upload_translate_usec = 0
+	last_upload_write_usec = 0
+	last_dispatch_usec = 0
+	last_download_read_usec = 0
+	last_download_translate_usec = 0
+	last_cpu_writeback_usec = 0
+	last_dispatched = false
+
 	# Cheap peek at whether this frame will actually fire a tick, so an
 	## idle-region OR a between-ticks frame (render FPS far exceeding the
 	# fixed 60 ticks/sec, exactly the asymmetry SIMULATION_TIMESCALE.md's CPU
 	# section already documents) doesn't pay for a redundant upload.
 	var will_tick: bool = (backend.accumulator + real_delta) >= backend.fixed_dt
 	var dispatch_region := _region # the region about to be dispatched, captured BEFORE it can change
+	last_region_w = dispatch_region.size.x
+	last_region_h = dispatch_region.size.y
 
 	if will_tick and backend.region_active and dispatch_region.size.x > 0 and dispatch_region.size.y > 0:
+		var t0 := Time.get_ticks_usec()
 		var upload := _translate_cpu_to_gpu(sim_world.get_materials_rect(
 			dispatch_region.position.x, dispatch_region.position.y, dispatch_region.size.x, dispatch_region.size.y
 		))
+		last_upload_translate_usec = Time.get_ticks_usec() - t0
+
+		t0 = Time.get_ticks_usec()
 		backend.gpu.write_rect(dispatch_region.position.x, dispatch_region.position.y, dispatch_region.size.x, dispatch_region.size.y, upload)
+		last_upload_write_usec = Time.get_ticks_usec() - t0
 
 	var result: Dictionary = backend.advance_active_region(real_delta)
+	# GPUSandPoC.last_compute_usec (surfaced here as result.compute_usec) is
+	# submit()+sync() wall time - the RD API gives no way to separately time
+	# "GPU actually computing" vs. "CPU blocked waiting for GPU completion"
+	# from GDScript; see the doc note this instrumentation's findings get
+	# written up under for why that matters here.
+	last_dispatch_usec = result.get("compute_usec", 0)
 
 	if result.get("dispatched", false):
+		last_dispatched = true
+		var t0 := Time.get_ticks_usec()
 		var gpu_ints := backend.gpu.read_rect(dispatch_region.position.x, dispatch_region.position.y, dispatch_region.size.x, dispatch_region.size.y)
+		last_download_read_usec = Time.get_ticks_usec() - t0
+
+		t0 = Time.get_ticks_usec()
 		var cpu_bytes := _translate_gpu_to_cpu(gpu_ints)
+		last_download_translate_usec = Time.get_ticks_usec() - t0
+
+		t0 = Time.get_ticks_usec()
 		sim_world.set_materials_rect(dispatch_region.position.x, dispatch_region.position.y, dispatch_region.size.x, dispatch_region.size.y, cpu_bytes)
+		last_cpu_writeback_usec = Time.get_ticks_usec() - t0
+
+		dispatched_frame_count += 1
+		total_upload_translate_usec += last_upload_translate_usec
+		total_upload_write_usec += last_upload_write_usec
+		total_dispatch_usec += last_dispatch_usec
+		total_download_read_usec += last_download_read_usec
+		total_download_translate_usec += last_download_translate_usec
+		total_cpu_writeback_usec += last_cpu_writeback_usec
 
 	_region = backend.region_rect
+	last_advance_total_usec = Time.get_ticks_usec() - t_advance_start
+	total_frame_count += 1
+	total_advance_usec_all_frames += last_advance_total_usec
+	if last_dispatched:
+		total_advance_usec += last_advance_total_usec # dispatched-frames-only sum - see avg_advance_total_usec
 	return result
+
+## Snapshot of this-frame + cumulative-average per-stage costs, for a
+## debug overlay or a diagnostic script to print without reaching into
+## every field individually. See the *_usec field doc comments above for
+## what each stage actually measures.
+func get_stage_metrics() -> Dictionary:
+	var avg := func(total: int) -> float:
+		return (float(total) / dispatched_frame_count) if dispatched_frame_count > 0 else 0.0
+	return {
+		"region_w": last_region_w,
+		"region_h": last_region_h,
+		"region_cells": last_region_w * last_region_h,
+		"dispatched_frame_count": dispatched_frame_count,
+		"last_dispatched": last_dispatched,
+		"last_upload_translate_usec": last_upload_translate_usec,
+		"last_upload_write_usec": last_upload_write_usec,
+		"last_dispatch_usec": last_dispatch_usec,
+		"last_download_read_usec": last_download_read_usec,
+		"last_download_translate_usec": last_download_translate_usec,
+		"last_cpu_writeback_usec": last_cpu_writeback_usec,
+		"last_advance_total_usec": last_advance_total_usec,
+		"avg_upload_translate_usec": avg.call(total_upload_translate_usec),
+		"avg_upload_write_usec": avg.call(total_upload_write_usec),
+		"avg_dispatch_usec": avg.call(total_dispatch_usec),
+		"avg_download_read_usec": avg.call(total_download_read_usec),
+		"avg_download_translate_usec": avg.call(total_download_translate_usec),
+		"avg_cpu_writeback_usec": avg.call(total_cpu_writeback_usec),
+		"avg_advance_total_usec": avg.call(total_advance_usec), # dispatched frames only
+		"total_frame_count": total_frame_count, # every advance() call this session, dispatched or not
+		"avg_advance_usec_all_frames": (float(total_advance_usec_all_frames) / total_frame_count) if total_frame_count > 0 else 0.0, # includes idle no-op frames - shows the bridge's TRUE average per-frame cost across a whole session, not just its cost when active
+	}
 
 ## Called by mining_building.gd (or any future world-changing feature) after
 ## a write that might introduce/expose SAND or WATER - the GPU-side analog

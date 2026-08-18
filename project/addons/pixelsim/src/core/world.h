@@ -14,6 +14,15 @@ struct StepStats {
     uint64_t cells_moved = 0;
     uint64_t reaction_checks = 0;    // try_react() invocations (see MATERIAL_REACTIONS.md)
     uint64_t reactions_executed = 0; // of which actually fired a reaction
+    // Cells whose movement dispatch (solve_powder/solve_liquid) was skipped
+    // this call because set_movement_externally_owned() is true for that
+    // cell's material (GPU production bridge) - see the gate at step()'s
+    // dispatch site. A material with this gate enabled can NEVER contribute
+    // to cells_moved via movement (the dispatch simply never runs) - this
+    // counter exists so that claim is measured, not just structurally
+    // argued, per SIMULATION_TIMESCALE.md's regression-investigation
+    // instrumentation.
+    uint64_t movement_gated_skips = 0;
     int active_chunks = 0;   // not sleeping
     int sleeping_chunks = 0;
     int total_chunks = 0;

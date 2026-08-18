@@ -388,7 +388,7 @@ Neither gap is in `CPUSimulationBackend`'s accumulator itself (that mechanism's 
 
 ## GPU Production Wiring
 
-**Status: CURRENT / IMPLEMENTED — scope: SAND+WATER movement only.** The GPU PoC is now reachable from `Main.tscn`/`main.gd`, superseding this document's earlier "not wired into any production path" framing for the SAND+WATER movement question specifically — see [Prohibited This Phase](#prohibited-this-phase) above (Phase 2C's own scope boundary) for what this milestone deliberately did *not* extend to.
+**Status: WIRING/CORRECTNESS IMPLEMENTED AND VERIFIED — PERFORMANCE REGRESSION IDENTIFIED, ROOT-CAUSED, NOT YET FIXED.** Do not read this as a GO on production performance — see [Regression Investigation](#regression-investigation--root-cause-analysis) below for the full findings before drawing any performance conclusion from this section. The GPU PoC is now reachable from `Main.tscn`/`main.gd`, superseding this document's earlier "not wired into any production path" framing for the SAND+WATER movement question specifically — see [Prohibited This Phase](#prohibited-this-phase) above (Phase 2C's own scope boundary) for what this milestone deliberately did *not* extend to.
 
 **What "wired in" means here, precisely:** `GPUSimulationBackend`/`GPUSandPoC` now compute where every SAND and WATER cell moves each physics tick, for the real, live game world. Everything else — the Material Reaction System, GRAVEL/LAVA movement, mining, building, player collision, and rendering — stays 100% CPU/`PixelSimWorld`, byte-for-byte unmodified in behavior. `PixelSimWorld` (CPU `World`) remains the single, authoritative source of truth every downstream system reads; GPU only decides *who moves* SAND/WATER, writing its result back through the same `set_cell()` path movement already used.
 
@@ -413,7 +413,88 @@ Neither gap is in `CPUSimulationBackend`'s accumulator itself (that mechanism's 
 - GPU correctness suite (`gpu_solver_tests.gd`): **40/40 checks passed**, unaffected (zero shader changes this milestone).
 - `CPUFPSIndependenceTest`: still byte-exact identical across 60/120/240/500 synthetic render cadences — this bridge doesn't touch that code path at all (a different `World` instance, gate never enabled there).
 - **Live, in-editor functional checks against the real `Main.tscn` scene** (not a synthetic test world): mining a real DIRT patch dropped 31 SAND cells (drop_ratio 0.5 of 62 removed, exact), which then genuinely fell under GPU control (settled 6 rows below the mine point) with mass conserved exactly; a second simultaneous mining action (59 removed → 29 dropped) settled correctly alongside the first, total SAND conserved exactly (60/60); a WATER+DIRT→MUD reaction fired correctly through the unmodified CPU reaction system using GPU-synced WATER positions (12/12 WATER cells converted); the GPU active region correctly woke on mining and went back to sleep once both piles settled (`region_active: false`, `backlog: 0` throughout, `cpu_active_chunks: 0` at rest); rendering showed both settled piles with no stale/duplicate pixels.
-- **Not evaluated by this milestone: performance.** This work is about correctness/wiring, not speed — no stress-test/benchmark numbers were generated or claimed here, consistent with this document's own [Stress-Test Instrumentation Trustworthiness](#stress-test-instrumentation-trustworthiness-frame-time--stutter--per-tick-timing) precedent (avg-FPS-only claims are exactly what that section warned against trusting). Whether this changes real gameplay performance — and whether the active-region re-upload/download cost (already flagged as workload-shape-sensitive in GPU_ACTIVE_REGION.md) matters in practice — is an open question for a future, human-run measurement pass, not something asserted here.
+- **Not evaluated by this milestone: performance.** This work is about correctness/wiring, not speed — no stress-test/benchmark numbers were generated or claimed here, consistent with this document's own [Stress-Test Instrumentation Trustworthiness](#stress-test-instrumentation-trustworthiness-frame-time--stutter--per-tick-timing) precedent (avg-FPS-only claims are exactly what that section warned against trusting). Whether this changes real gameplay performance — and whether the active-region re-upload/download cost (already flagged as workload-shape-sensitive in GPU_ACTIVE_REGION.md) matters in practice — was flagged as an open question. **It has since been answered — see below.**
+
+---
+
+## Regression Investigation — Root Cause Analysis
+
+**Trigger:** after the wiring above shipped, manual gameplay testing reported the whole game's performance got measurably worse, *and* SAND still didn't visibly fall faster than before. This section is instrumentation + measurement + analysis only — **no gravity, fixed timestep, solver, or `simulation_budget_ms` changes were made while investigating this**, per explicit instruction. Nothing below has been fixed yet.
+
+### Primary question: why did overall performance get worse?
+
+**Not the compute shader.** Measured GPU compute+sync cost (`GPUSandPoC.last_compute_usec`, i.e. `submit()`+`sync()` wall time) averaged **~1.5-1.9 ms per dispatch** — consistent with Phase 2C's own 70×+ real-time-margin finding above. GPU compute is roughly 3-4% of the actual per-dispatch cost. The other ~96% is the CPU-side orchestration surrounding it.
+
+**The dominant cost is `GPUSandPoC.read_rect()`'s per-row `RenderingDevice.buffer_get_data()` loop.** `write_rect()`/`read_rect()` do one RD API call *per row* of the dispatched rectangle (each row is one contiguous span in the flat row-major GPU buffer — see their own doc comments in `gpu_sand_poc.gd`). For the active regions actually observed in live gameplay (see below, ~320-384 cells per side, i.e. 320-384 rows), that's 320-384 individual `buffer_get_data()` calls **every single dispatched frame**. Measured: **~35-38 ms** average, ~81% of total per-dispatch cost, vs. `write_rect()`'s much cheaper ~0.2 ms for the same row count (~0.6 µs/row) — `buffer_update()` can apparently just queue into the command stream, while `buffer_get_data()` appears to force some form of per-call synchronization/flush on this local `RenderingDevice`. This was not assumed - it's the single largest number in every sample taken.
+
+**Compounding cause: the active region is far larger than the actual activity.** `GPUProductionBridge.wake_region()` → `GPUSimulationBackend.wake_region()`/`_align_region()`/`_margin_chunks_for()` sizes the safety margin off `GPUSimulationBackend.DEFAULT_MAX_TICKS_PER_FRAME` (10) **unconditionally**, regardless of how small the triggering event actually is: `margin_chunks_for(10) = ceil(10/64)+1 = 2` chunks of padding on every side, chunk-aligned (64-cell chunks) — so even a tiny, localized mining action (radius 8-18 cells) produces a minimum active region on the order of **320×320 to 384×320 cells (~102,000-123,000 cells)**, live-measured, for a drop of only 53-193 actual SAND cells. That's the exact "active chunks are few but the whole buffer moves" pattern this investigation was asked to check for (see [GPU Buffer / Active Region](#active-region-and-buffer-io-live-measurements) below) - confirmed. This inflates steps 1/2's already-expensive per-row I/O by roughly 12-25× more rows than the actual affected area would need.
+
+**Total measured cost per dispatched frame: ~47-54 ms** (`GPUProductionBridge.get_stage_metrics()`'s `avg_advance_total_usec`, stable across repeated live measurements) — **2.8-3.2× a full 60fps frame budget (16.67 ms), in ONE synchronous, main-thread-blocking call**, since `gpu_bridge.advance()` runs directly inside `main.gd`'s `_process()`, before rendering. This is not a subtle regression; it is a direct, measured, per-mining-event stall.
+
+**Crucially — this is exactly the "average hides the spike" trap the CPU stress-test instrumentation work already warned about, now proven to apply here too:** across a whole live session (21,040 total `advance()` calls, only 14 of them dispatched), the *session-wide* average cost was a reassuring-looking **~39-62 µs/frame** (`avg_advance_usec_all_frames`) — because the other 21,026 idle frames cost ~6-12 µs each. Only sampling the 14 dispatched frames specifically reveals the real ~47-54 ms spikes. An FPS counter or a naive average would completely hide this.
+
+### Production path trace (what's CPU vs. GPU, blocking vs. not)
+
+```
+main.gd._process(delta)
+  gpu_bridge.advance(delta)                     [CPU, GDScript, main thread]
+    if will_tick and region active:
+      sim_world.get_materials_rect(region)       CPU, C++ (loop, cheap)
+      translate CPU ids -> GPU ids               CPU, GDScript loop over region_cells  <- ~3.3-3.6ms
+      backend.gpu.write_rect(region, ...)         GPU, N=region_h buffer_update() calls  <- ~0.2ms (cheap)
+    backend.advance_active_region(delta)
+      run_ticks_active_region(ticks)
+        gpu.step_region(...)                      GPU: dispatch + submit() + sync()      <- ~1.5-1.9ms (BLOCKS until GPU done)
+        gpu.read_bounds()                         GPU: one 16-byte buffer_get_data() (cheap, not the region readback)
+    if dispatched:
+      backend.gpu.read_rect(region)               GPU, N=region_h buffer_get_data() calls <- ~35-38ms (DOMINANT COST, BLOCKS per call)
+      translate GPU ids -> CPU ids                 CPU, GDScript loop over region_cells   <- ~3.0-3.4ms
+      sim_world.set_materials_rect(region, ...)     CPU, C++ (per-cell get_material+set_cell) <- ~0.5ms
+  cpu_backend.advance(delta)                      [CPU, unaffected by any of the above - reactions/GRAVEL/LAVA/etc.]
+rendering (chunk_renderer.gd)                     [CPU, unaffected - unchanged from before this milestone]
+```
+
+Every stage marked "BLOCKS" runs synchronously on the main thread before the frame can proceed to rendering — there is no async/deferred readback anywhere in this pipeline. No duplicate dispatch exists (`step_region()` is called exactly once per tick-batch, handling every material in the region in one pass — confirmed by code trace, not just assumed). No buffer/pipeline/shader (re)allocation happens in this hot path — `setup_grid()`/shader compile run exactly once, in `GPUProductionBridge._init()`, confirmed by code trace.
+
+### Active region and buffer I/O (live measurements)
+
+| Event | DIRT removed | SAND dropped | Active region | Region cells | Dispatched frames to settle |
+|---|---:|---:|---|---:|---:|
+| Mining #1 (radius 8) | 106 | 53 | 384×320 | 122,880 | 5 |
+| Mining #2 (radius 16) | 387 | ~193 | 320×320 | 102,400 | 14 |
+
+For comparison, the CPU chunk-sleep model (unaffected, still active for every other material) would only mark the 1-2 actual 64×64 chunks touched by a mining action of this size as active — on the order of 4,096-8,192 cells, not 100,000+. The GPU active region here is roughly **12-25× larger than the area actually doing anything**, entirely a byproduct of the fixed `margin_chunks_for(DEFAULT_MAX_TICKS_PER_FRAME)` sizing, not of the SAND/WATER activity itself.
+
+### CPU double-work: checked, not just assumed
+
+New instrumentation (`StepStats::movement_gated_skips`, exposed via `PixelSimWorld.get_stats()["movement_gated_skips"]`) counts cells where `World::step()` reached the movement-dispatch site for a SAND/WATER cell and skipped it because `externally_owned_movement_` is set — proof the CPU-side gate is structurally engaged, not just present in code. A dedicated C++ test (`test_movement_gated_skips_counts_only_gated_movable_cells`) confirms the counter fires exactly once per gated movable cell touched, `cells_moved` stays 0 for those cells, and reactions remain unaffected. Live `get_stats()` sampling during settled/idle windows correctly showed `movement_gated_skips: 0` (nothing to skip when nothing's active) — consistent, not contradictory; the counter is proven correct at the unit level and structurally guaranteed live (the gate is a hard `if` branch — a gated material's movement dispatch code path cannot execute at all, not "usually doesn't"). **CPU double-work is ruled out as a contributing cause.**
+
+### The two problems, kept separate as instructed
+
+1. **"Overall game performance got worse."** Root-caused above: the ~47-54 ms per-dispatch stall from `read_rect()`'s per-row readback, amplified by an oversized active region. This is a **performance/architecture problem**, not a physics problem.
+2. **"SAND still doesn't fall as fast as expected."** Measured separately: mining event #2 (~193 SAND cells) took 14 dispatched ticks to fully settle — at `fixed_dt = 1/60s`, that's **~0.23s of physical simulation time**, which is fast and unremarkable; physics ticks-to-settle is **not** abnormal, so this is **not** a physics-timescale/solver problem (gravity, `fixed_dt`, and the solvers were not touched or suspected further, per instruction). What *is* abnormal: **wall-clock** time to settle those same 14 ticks was 14 × ~47-54ms ≈ **0.66-0.76 seconds of real time** — roughly 3× the physical simulation time — because each tick's *real-world* duration is inflated by the I/O overhead above, even though the simulated `fixed_dt` per tick is unchanged. **The "slow-falling SAND" perception and the "worse overall performance" finding are the same root cause, not two separate problems** — every tick is real-time-expensive, so both physical settling *feels* slow (stretched across visible stutters) and every other frame in the game gets stalled behind it.
+
+### Root cause ranking
+
+| Priority | Finding | Evidence |
+|---|---|---|
+| **P0** | `GPUSandPoC.read_rect()`'s per-row `buffer_get_data()` loop is the dominant cost (~35-38ms/dispatch, ~81% of total) — one blocking RD call per region row instead of one bulk call for the whole rect | Directly measured, stable across repeated samples |
+| **P0** | The entire `gpu_bridge.advance()` pipeline is synchronous/main-thread-blocking, called directly from `_process()` before rendering — ~47-54ms per dispatched frame, 2.8-3.2× a 60fps frame budget, in one call | Directly measured; code trace confirms no async/deferred path exists |
+| **P1** | `wake_region()`'s margin sizing (`margin_chunks_for(DEFAULT_MAX_TICKS_PER_FRAME=10)`) inflates the minimum active region to ~320-384 cells/side regardless of the triggering event's actual size - multiplies P0's already-expensive per-row cost by ~12-25× more rows than the actual activity needs | Live-measured region sizes (102,400-122,880 cells) vs. estimated actual-activity size (a few thousand cells) |
+| **P1** | GDScript-level CPU↔GPU material-id translation (`_translate_cpu_to_gpu`/`_translate_gpu_to_cpu`) costs ~3.0-3.6ms each way, proportional to the (inflated) region size | Directly measured |
+| **P2** | `PixelSimWorld::set_materials_rect()`'s C++ writeback touches every cell of the (inflated) region to check for changes, even though only actually-changed cells get `set_cell()`'d | Directly measured (~0.5ms) - small on its own, but also inherits the P1 region-size inflation |
+| **P3** | GPU compute itself (`step_region()`'s dispatch+sync) — genuinely fast, ~1.5-1.9ms, ~3-4% of total cost. Not a meaningful contributor. | Directly measured; consistent with Phase 2C's own 70×+ real-time-margin benchmark |
+
+**Ruled out, not just assumed:** CPU double-moving GPU-owned materials (see above); duplicate/repeated dispatch per tick; runtime buffer/pipeline/shader (re)allocation in the hot path; the fixed-timestep/tick-rate itself (physics ticks-to-settle measured normal).
+
+### New instrumentation added by this investigation
+
+- `GPUProductionBridge`: per-stage timing (`last_upload_translate_usec`, `last_upload_write_usec`, `last_dispatch_usec`, `last_download_read_usec`, `last_download_translate_usec`, `last_cpu_writeback_usec`, `last_advance_total_usec`, plus cumulative/average variants and `get_stage_metrics()`) - zero behavior change, timing calls bracketing the existing pipeline only.
+- `World`/`PixelSimWorld`: `StepStats::movement_gated_skips`, exposed via `get_stats()["movement_gated_skips"]`.
+
+### What this investigation did NOT do
+
+No fix was applied. Gravity, fixed timestep, the SAND/WATER solvers, `simulation_budget_ms`, and the Material Reaction System rules are all byte-for-byte unchanged. The obvious next steps this analysis points toward (a bulk rect read/write RD API instead of per-row calls; sizing `wake_region()`'s margin off the actual triggering event instead of a fixed worst-case constant) are **not implemented here** - they're implied by the P0/P1 findings above, not decided or attempted. The final 10k-500k manual gameplay validation remains the user's own, to be run after reviewing these findings.
 
 ---
 

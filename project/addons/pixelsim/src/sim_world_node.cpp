@@ -140,6 +140,7 @@ Dictionary PixelSimWorld::step_simulation(double delta) {
     d["cells_moved"] = static_cast<int64_t>(last_stats_.cells_moved);
     d["reaction_checks"] = static_cast<int64_t>(last_stats_.reaction_checks);
     d["reactions_executed"] = static_cast<int64_t>(last_stats_.reactions_executed);
+    d["movement_gated_skips"] = static_cast<int64_t>(last_stats_.movement_gated_skips);
     d["active_chunks"] = last_stats_.active_chunks;
     d["sleeping_chunks"] = last_stats_.sleeping_chunks;
     d["total_chunks"] = last_stats_.total_chunks;
@@ -363,6 +364,7 @@ Dictionary PixelSimWorld::get_stats() const {
     d["cells_moved"] = static_cast<int64_t>(last_stats_.cells_moved);
     d["reaction_checks"] = static_cast<int64_t>(last_stats_.reaction_checks);
     d["reactions_executed"] = static_cast<int64_t>(last_stats_.reactions_executed);
+    d["movement_gated_skips"] = static_cast<int64_t>(last_stats_.movement_gated_skips);
     d["active_chunks"] = last_stats_.active_chunks;
     d["sleeping_chunks"] = last_stats_.sleeping_chunks;
     d["total_chunks"] = last_stats_.total_chunks;
