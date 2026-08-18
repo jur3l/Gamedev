@@ -78,6 +78,24 @@ layout(set = 0, binding = 2, std430) restrict buffer BoundsBuf {
 }
 bounds_buf;
 
+// Phase 2E (GPU_MATERIAL_INTERACTIONS.md "GPU Representation" / "Lookup
+// Model") - dense MAX_MATERIALS x MAX_MATERIALS reaction rule table,
+// indexed rules[a * MAX_MATERIALS + b]. Filled symmetrically by the CPU
+// (GPUSandPoC.set_reaction_rule()) so a single direct read always gives the
+// correct "what do I become" answer regardless of lookup order - no
+// runtime ordering branch. result_a == a && result_b == b (identity) means
+// "no reaction for this pair" - there is no separate has-rule flag.
+struct ReactionRule {
+    uint result_a;
+    uint result_b;
+    float probability;
+    uint _reserved;
+};
+layout(set = 0, binding = 3, std430) restrict readonly buffer RuleBuf {
+    ReactionRule rules[];
+}
+rule_buf;
+
 layout(push_constant, std430) uniform Params {
     uint width;   // full world width - bounds-check reference, unchanged meaning
     uint height;  // full world height - unchanged meaning
@@ -97,12 +115,27 @@ params;
 
 // Material IDs - PoC scope only (GPU_SIMULATION.md "GPU State
 // Representation"): AIR/STONE (Phase 2A statics), SAND (Phase 2A powder),
-// WATER (Phase 2B liquid). No LAVA, no reactions, no MUD - explicitly out
-// of Phase 2B scope (see the request's §1/§23).
+// WATER (Phase 2B liquid). No LAVA, no MUD - explicitly out of scope (see
+// GPU_MATERIAL_INTERACTIONS.md "Future Lava").
 const uint MAT_AIR = 0u;
 const uint MAT_SAND = 1u;
 const uint MAT_STONE = 2u;
 const uint MAT_WATER = 3u;
+// Phase 2E (GPU_MATERIAL_INTERACTIONS.md "Testing") - two materials that
+// exist ONLY to validate the reaction architecture in isolation, never
+// appearing in any Phase 2A/2B/2D test's initial state. Deliberately NOT a
+// reuse of SAND/STONE/WATER, all three of which are already load-bearing
+// fixtures (STONE especially, as the near-universal inert floor/wall) in
+// the existing 55-test suite - see GPU_MATERIAL_INTERACTIONS.md "Testing"
+// for why reusing them would repeat a mistake already made and fixed once
+// on the CPU side (MATERIAL_REACTIONS.md "Current Reactions").
+const uint MAT_REACT_TEST_A = 4u;
+const uint MAT_REACT_TEST_B = 5u;
+// Phase 2E (GPU_MATERIAL_INTERACTIONS.md "GPU Representation") - dense
+// reaction-rule table dimension. A compile-time shader constant, not a
+// runtime value - growing past it needs a shader recompile, same cost class
+// as local_size_x/y.
+const uint MAX_MATERIALS = 16u;
 
 // Behavior + density, mirroring core/material.cpp's MATERIAL_TABLE for
 // exactly the 4 materials this PoC knows about. Deliberately inlined as
@@ -356,6 +389,60 @@ ivec2 resolve_winner_for(ivec2 dest, uint step_index, uint seed) {
     return ivec2(-1, -1); // unreachable
 }
 
+// Phase 2E (GPU_MATERIAL_INTERACTIONS.md "Reaction Resolution") - checks
+// p's 4 orthogonal neighbors, in a fixed priority order (up, down, left,
+// right - matches the CPU reference's own order, MATERIAL_REACTIONS.md), for
+// the first one with a non-identity rule against mat. Pure function of the
+// previous buffer only - does NOT itself check mutual agreement (that's one
+// level up, in try_mutual_reaction() - GPU compute shaders don't support
+// recursion, so this stays a single, bounded, non-recursive helper, exactly
+// mirroring resolve_winner_shallow()'s role for movement).
+ivec2 shallow_reaction_partner(ivec2 p, uint mat) {
+    ivec2 offsets[4] = ivec2[4](ivec2(0, -1), ivec2(0, 1), ivec2(-1, 0), ivec2(1, 0));
+    for (int i = 0; i < 4; i++) {
+        ivec2 n = p + offsets[i];
+        if (!in_bounds(n)) continue;
+        uint nm = read_cell(n);
+        ReactionRule rule = rule_buf.rules[mat * MAX_MATERIALS + nm];
+        if (rule.result_a != mat || rule.result_b != nm) {
+            return n;
+        }
+    }
+    return ivec2(-1, -1);
+}
+
+// Phase 2E: p reacts with a neighbor q this tick IFF q is p's own first
+// choice (shallow_reaction_partner(p)) AND p is ALSO q's own first choice
+// (shallow_reaction_partner(q) == p) - mutual agreement, computed
+// independently by both cells' threads from the same read-only snapshot,
+// no cross-thread communication. This is what prevents the class of
+// mass-duplication bug Phase 2B found in movement (GPU_MATERIAL_
+// INTERACTIONS.md "Reaction Resolution"). Returns true and writes
+// out_next_val if a reaction fires this tick; false (out_next_val
+// untouched) if p's first choice doesn't reciprocate, or the probability
+// roll fails - in either case p falls through to normal movement/
+// interaction evaluation, unchanged.
+bool try_mutual_reaction(ivec2 p, uint mat, uint step_index, uint seed, out uint out_next_val) {
+    ivec2 q = shallow_reaction_partner(p, mat);
+    if (q.x < 0) return false;
+    uint mat_q = read_cell(q);
+    if (shallow_reaction_partner(q, mat_q) != p) return false;
+
+    ReactionRule rule = rule_buf.rules[mat * MAX_MATERIALS + mat_q];
+    if (rule.probability < 1.0) {
+        // Guaranteed rules (probability >= 1.0) skip this draw entirely -
+        // same "don't perturb the shared deterministic stream for a
+        // guaranteed outcome" optimization the CPU reference uses
+        // (MATERIAL_REACTIONS.md "Determinism") - no second RNG, reuses
+        // the same hash_u32() every other GPU tie-break already uses.
+        uint h = hash_u32(uint(p.x) * 374761393u + uint(p.y) * 668265263u + step_index * 2246822519u + seed + 555555u);
+        float roll = float(h % 1000000u) / 1000000.0;
+        if (roll >= rule.probability) return false;
+    }
+    out_next_val = rule.result_a;
+    return true;
+}
+
 void main() {
     // Phase 2D: dispatched threads cover [rect_x, rect_x+rect_w) x
     // [rect_y, rect_y+rect_h), not necessarily the whole world - offset by
@@ -370,24 +457,35 @@ void main() {
     uint current = read_cell(p);
     uint next_val = current;
 
-    ivec2 winner = resolve_winner_for(p, params.step_index, params.seed);
-    if (winner.x >= 0) {
-        // Something displaces into me this step - my fate is decided
-        // regardless of whether I also tried to move away (see the file
-        // header's "Swap displacement" note for why this is correct).
-        next_val = read_cell(winner);
-    } else if (is_movable(current)) {
-        ivec2 target = compute_target(p, current, params.step_index, params.seed);
-        if (target != p) {
-            ivec2 target_winner = resolve_winner_for(target, params.step_index, params.seed);
-            if (target_winner == p) {
-                next_val = read_cell(target); // AIR in the common case, the displaced material in a swap
+    // Phase 2E: reaction is checked FIRST and, if it fires, movement/
+    // interaction is skipped entirely for this cell this tick - mutually
+    // exclusive, same rule the CPU reference uses (MATERIAL_REACTIONS.md
+    // "Simulation Integration"). The movement/interaction branch below is
+    // completely unmodified from Phase 2A/2B.
+    uint reacted_val;
+    bool reacted = try_mutual_reaction(p, current, params.step_index, params.seed, reacted_val);
+    if (reacted) {
+        next_val = reacted_val;
+    } else {
+        ivec2 winner = resolve_winner_for(p, params.step_index, params.seed);
+        if (winner.x >= 0) {
+            // Something displaces into me this step - my fate is decided
+            // regardless of whether I also tried to move away (see the file
+            // header's "Swap displacement" note for why this is correct).
+            next_val = read_cell(winner);
+        } else if (is_movable(current)) {
+            ivec2 target = compute_target(p, current, params.step_index, params.seed);
+            if (target != p) {
+                ivec2 target_winner = resolve_winner_for(target, params.step_index, params.seed);
+                if (target_winner == p) {
+                    next_val = read_cell(target); // AIR in the common case, the displaced material in a swap
+                }
+                // else: I tried to move but lost the contention - stay put (next_val already == current).
             }
-            // else: I tried to move but lost the contention - stay put (next_val already == current).
+            // else: blocked, stays put.
         }
-        // else: blocked, stays put.
+        // STATIC (STONE) or AIR-with-no-winner: unchanged.
     }
-    // STATIC (STONE) or AIR-with-no-winner: unchanged.
 
     output_buf.cells[p.y * int(params.width) + p.x] = next_val;
 

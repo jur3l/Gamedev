@@ -2,10 +2,12 @@ class_name GPUSandPoC
 extends RefCounted
 ## GPU simulation feasibility PoC (GPU_SIMULATION.md): Phase 2A (SAND) +
 ## Phase 2B (WATER) + Phase 2D (GPU_ACTIVE_REGION.md - rect-based partial
-## dispatch via step_region(), plus a GPU-computed activity bounds buffer).
-## EXPERIMENTAL - not the production simulation backend. Wraps a LOCAL
-## RenderingDevice (RenderingServer.create_local_rendering_device()) running
-## a ping-pong compute-shader solver (shaders/gpu_cellular_solver.glsl).
+## dispatch via step_region(), plus a GPU-computed activity bounds buffer)
+## + Phase 2E (GPU_MATERIAL_INTERACTIONS.md - set_reaction_rule(), a dense
+## material-pair reaction rule table). EXPERIMENTAL - not the production
+## simulation backend. Wraps a LOCAL RenderingDevice (RenderingServer.
+## create_local_rendering_device()) running a ping-pong compute-shader
+## solver (shaders/gpu_cellular_solver.glsl).
 ##
 ## Class name kept as GPUSandPoC across Phase 2B (not renamed) - it is a
 ## thin, material-agnostic buffer/dispatch/readback wrapper (setup_grid/step/
@@ -31,6 +33,16 @@ const MAT_AIR := 0
 const MAT_SAND := 1
 const MAT_STONE := 2
 const MAT_WATER := 3
+# Phase 2E (GPU_MATERIAL_INTERACTIONS.md) - test-only materials, never used
+# by any Phase 2A/2B/2D test's initial state. See gpu_active_region_tests.gd
+# for why SAND/STONE/WATER were deliberately NOT reused for this.
+const MAT_REACT_TEST_A := 4
+const MAT_REACT_TEST_B := 5
+
+# Phase 2E - dense reaction-rule table dimension, must match the shader's
+# own MAX_MATERIALS constant exactly.
+const MAX_MATERIALS := 16
+const RULE_ENTRY_BYTES := 16 # result_a(u32) + result_b(u32) + probability(f32) + reserved(u32)
 
 var available := false
 var width := 0
@@ -43,6 +55,7 @@ var _buf_a: RID
 var _buf_b: RID
 var _current_is_a := true # which buffer currently holds the latest state
 var _bounds_buf: RID # Phase 2D (GPU_ACTIVE_REGION.md) - 16-byte atomic min/max activity bbox
+var _rule_buf: RID # Phase 2E (GPU_MATERIAL_INTERACTIONS.md) - dense reaction rule table
 
 # --- Perf instrumentation (GPU_SIMULATION.md "Performance") ---
 # Populated by step()/read_back() - kept as separate numbers per the
@@ -86,9 +99,49 @@ func init() -> bool:
 		print("[GPUSandPoC] GPU backend unavailable: compute_pipeline_create failed")
 		return false
 
+	# Phase 2E: rule buffer created once per instance (not per grid reset -
+	# rules are material-system configuration, not grid state), defaulted to
+	# identity (no reactions) so every existing test/benchmark that never
+	# calls set_reaction_rule() is completely unaffected.
+	_rule_buf = _rd.storage_buffer_create(MAX_MATERIALS * MAX_MATERIALS * RULE_ENTRY_BYTES, _identity_rule_table_bytes())
+
 	available = true
 	print("[GPUSandPoC] GPU backend initialized")
 	return true
+
+static func _identity_rule_table_bytes() -> PackedByteArray:
+	var bytes := PackedByteArray()
+	bytes.resize(MAX_MATERIALS * MAX_MATERIALS * RULE_ENTRY_BYTES)
+	for a in range(MAX_MATERIALS):
+		for b in range(MAX_MATERIALS):
+			var off := (a * MAX_MATERIALS + b) * RULE_ENTRY_BYTES
+			bytes.encode_u32(off, a)     # result_a == a
+			bytes.encode_u32(off + 4, b) # result_b == b -> identity == "no reaction"
+			bytes.encode_float(off + 8, 1.0)
+			bytes.encode_u32(off + 12, 0)
+	return bytes
+
+## Configures a symmetric reaction rule (GPU_MATERIAL_INTERACTIONS.md "Lookup
+## Model"): a cell holding `mat_a` adjacent to one holding `mat_b` becomes
+## `result_a`/`result_b` respectively, on mutual agreement (see the shader's
+## try_mutual_reaction()). The swapped ordering is filled automatically, so
+## the shader's lookup is always a single direct read regardless of which
+## side matches which neighbor. probability defaults to 1.0 (guaranteed).
+func set_reaction_rule(mat_a: int, mat_b: int, result_a: int, result_b: int, probability: float = 1.0) -> void:
+	if not available:
+		return
+	_write_rule(mat_a, mat_b, result_a, result_b, probability)
+	_write_rule(mat_b, mat_a, result_b, result_a, probability)
+
+func _write_rule(a: int, b: int, ra: int, rb: int, probability: float) -> void:
+	var bytes := PackedByteArray()
+	bytes.resize(RULE_ENTRY_BYTES)
+	bytes.encode_u32(0, ra)
+	bytes.encode_u32(4, rb)
+	bytes.encode_float(8, probability)
+	bytes.encode_u32(12, 0)
+	var offset := (a * MAX_MATERIALS + b) * RULE_ENTRY_BYTES
+	_rd.buffer_update(_rule_buf, offset, RULE_ENTRY_BYTES, bytes)
 
 ## Allocates the double-buffered grid and uploads `initial` (one uint32 per
 ## cell, row-major, width*height entries - MAT_AIR/MAT_SAND/MAT_STONE).
@@ -177,7 +230,12 @@ func _dispatch_batch(steps: int, seed: int, start_step: int, rect_x: int, rect_y
 		uniform_bounds.binding = 2
 		uniform_bounds.add_id(_bounds_buf)
 
-		var uniform_set := _rd.uniform_set_create([uniform_read, uniform_write, uniform_bounds], _shader_rid, 0)
+		var uniform_rules := RDUniform.new()
+		uniform_rules.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+		uniform_rules.binding = 3
+		uniform_rules.add_id(_rule_buf)
+
+		var uniform_set := _rd.uniform_set_create([uniform_read, uniform_write, uniform_bounds, uniform_rules], _shader_rid, 0)
 
 		var push_constant := PackedByteArray()
 		push_constant.resize(32) # 8x uint32: width, height, step_index, seed, rect_x, rect_y, rect_w, rect_h
@@ -249,6 +307,8 @@ func cleanup() -> void:
 		_rd.free_rid(_buf_b)
 	if _bounds_buf.is_valid():
 		_rd.free_rid(_bounds_buf)
+	if _rule_buf.is_valid():
+		_rd.free_rid(_rule_buf)
 	if _pipeline_rid.is_valid():
 		_rd.free_rid(_pipeline_rid)
 	if _shader_rid.is_valid():
@@ -256,6 +316,7 @@ func cleanup() -> void:
 	_buf_a = RID()
 	_buf_b = RID()
 	_bounds_buf = RID()
+	_rule_buf = RID()
 	_pipeline_rid = RID()
 	_shader_rid = RID()
 	# _rd itself is RefCounted (Godot 4.7.1 API: RenderingDevice inherits

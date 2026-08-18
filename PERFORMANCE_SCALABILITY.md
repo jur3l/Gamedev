@@ -478,6 +478,24 @@ The FPS difference is uniform across every workload tier (not scaling with simul
 
 ---
 
+## Phase 2E — GPU Material Interaction / Reaction Architecture
+
+**Status: DONE — GO.** Full detail in **[GPU_MATERIAL_INTERACTIONS.md](GPU_MATERIAL_INTERACTIONS.md)** — this is a scalability-focused summary.
+
+**What this measures:** whether a general reaction framework (a dense rule-lookup table + mutual-agreement resolution) costs anything when unused, and how much it costs when heavily used, isolated from any specific material's gameplay behavior via two synthetic placeholder materials.
+
+| Scenario (250-chunk region, single tick) | `compute_usec` |
+|---|---:|
+| No reaction rules configured | ~7,526 |
+| Rules configured, idle (no reacting material present) | ~7,347 |
+| Reaction-heavy (100% of the region reacting) | ~1,965 (comparable region, all-material density) |
+
+**Idle cost is statistically indistinguishable from no-rules-at-all** — confirms the O(1)/branch-free dense-table design costs nothing for materials that never match a rule, the specific property this measurement existed to check. Even a deliberately worst-case, 100%-reaction-density region stays comfortably inside the 60Hz real-time budget (~2ms of ~16.7ms available). Rule table memory: 4,096 bytes, fixed, independent of world/active-region size.
+
+**Decision: GO.** 83/83 correctness checks (16 new + the pre-existing 55, zero regressions), mass conservation verified structurally and by test, chunk/corner boundary and active-region integration confirmed. See GPU_MATERIAL_INTERACTIONS.md "Architecture Decision" for the full reasoning, including what still gates an actual Lava port (its movement interaction with WATER, not its reaction rule).
+
+---
+
 ## Correctness Verification
 
 Verified live, pixel-for-pixel against C++ ground truth, before considering the optimization complete:

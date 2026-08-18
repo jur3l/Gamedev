@@ -451,3 +451,19 @@ Everything in PROJECT_ARCHITECTURE.md §13/§14 and PERFORMANCE_SCALABILITY.md's
 **Still not done, same pattern as every prior phase:** no LAVA, no Material Reaction System, no player-collision/mining GPU migration, no GPU rendering, no production wiring. See GPU_ACTIVE_REGION.md "Architecture Decision" for the specific conditions attached to this phase's GO.
 
 **New files, all GDScript + one shader extension, zero C++ changed:** `project/scripts/gpu_active_region_tests.gd`, `project/scripts/gpu_active_region_benchmark.gd`; `project/shaders/gpu_cellular_solver.glsl` extended (push constants + a third storage buffer, purely additive — the SAND/WATER movement rules are byte-for-byte unchanged); `gpu_sand_poc.gd`/`gpu_simulation_backend.gd` extended with `step_region()`/active-region tracking (existing `step()`/`advance()`/`run_ticks_unpaced()` behaviorally unchanged, all Phase 2C tests/benchmarks remain valid).
+
+---
+
+# Phase 2E — GPU Material Interaction / Reaction Architecture
+
+**Status: DONE — GO.** Full detail in **[GPU_MATERIAL_INTERACTIONS.md](GPU_MATERIAL_INTERACTIONS.md)** — this is a brief pointer, not a duplicate.
+
+**What this phase proves:** that adding a *reacting* material (Lava, eventually) is "a material ID + a rule + a movement classification," not a new simulation engine. Adds a dense, O(1), branch-free material×material rule lookup table (a fourth storage buffer) and a mutual-agreement reaction resolution — a direct structural reuse of Phase 2B's own `resolve_winner_shallow`/`resolve_winner_for` two-tier pattern, applied to reaction instead of movement, specifically to avoid repeating that phase's mass-duplication bug. Reaction is checked before movement, mutually exclusive per cell per tick, mirroring the CPU reference (`MATERIAL_REACTIONS.md`) exactly. The existing movement/interaction code is untouched.
+
+**Validated with two synthetic placeholder materials, not Lava** — `MAT_REACT_TEST_A`/`B`, used only by this phase's own tests, deliberately *not* a reuse of SAND/STONE/WATER (all three are load-bearing fixtures in the existing 55-test suite, and STONE specifically already caused one CPU-side reaction-choice mistake this project corrected once — `MATERIAL_REACTIONS.md` "Current Reactions" — not worth repeating on the GPU side).
+
+**Headline results:** 83/83 correctness checks (16 new + the full pre-existing 55, zero regressions). Idle reaction rules cost the same as no rules configured at all (~7.3–7.5k µs, statistically indistinguishable) — the O(1) lookup design's core promise, measured not assumed. A deliberately worst-case, 100%-reaction-density region costs ~5.8× more than an equivalent all-SAND region, but still only ~2ms — comfortably inside the 60Hz real-time budget. Mass conservation, chunk/corner boundaries, active-region wake/sleep, and determinism all verified with dedicated tests.
+
+**Still not done:** Lava itself (this phase proves the mechanism is ready, not that Lava is built), chemistry/temperature, chained same-tick reactions, GPU rendering, production wiring. See GPU_MATERIAL_INTERACTIONS.md "Architecture Decision" for what actually still gates a real Lava port (its *movement* interaction with WATER, untested by this phase, not its reaction rule).
+
+**New files, one shader extension, zero C++ changed:** `project/scripts/gpu_reaction_tests.gd`; `project/shaders/gpu_cellular_solver.glsl` extended again (a fourth storage buffer + two new functions, purely additive); `gpu_sand_poc.gd` extended with `set_reaction_rule()` (defaults to identity/no-reaction, so every earlier phase's test/benchmark is unaffected without calling it).
