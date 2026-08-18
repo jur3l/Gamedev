@@ -1,0 +1,25 @@
+[gd_scene format=3 uid="uid://ijhkjhk4ytu8"]
+
+[ext_resource type="Script" uid="uid://ch4icd7vut6la" path="res://scripts/gpu_preview.gd" id="1_685sw"]
+
+[node name="GPUPreview" type="Node2D" unique_id=379304829]
+script = ExtResource("1_685sw")
+
+[node name="Sprite2D" type="Sprite2D" parent="." unique_id=1664784142]
+
+[node name="CanvasLayer" type="CanvasLayer" parent="." unique_id=1434844437]
+
+[node name="StatusLabel" type="Label" parent="CanvasLayer" unique_id=1161549852]
+offset_left = 16.0
+offset_top = 12.0
+offset_right = 1416.0
+offset_bottom = 92.0
+theme_override_colors/font_color = Color(1, 1, 1, 1)
+autowrap_mode = 3
+
+[node name="StatsLabel" type="Label" parent="CanvasLayer" unique_id=209872713]
+offset_left = 16.0
+offset_top = 100.0
+offset_right = 1016.0
+offset_bottom = 240.0
+theme_override_colors/font_color = Color(0.85, 0.95, 1, 1)
