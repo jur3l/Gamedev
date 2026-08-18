@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://t11yhmngwcgk"
+path="res://.godot/imported/gpu_sand_solver.glsl-1ab6183ae358677fc9f1292e022f373e.res"
+
+[deps]
+
+source_file="res://shaders/gpu_sand_solver.glsl"
+dest_files=["res://.godot/imported/gpu_sand_solver.glsl-1ab6183ae358677fc9f1292e022f373e.res"]
+
+[params]
+

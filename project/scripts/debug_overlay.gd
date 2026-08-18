@@ -65,6 +65,11 @@ func _process(_delta: float) -> void:
 	text += "FPS: %d (%.2f ms/frame)\n" % [Engine.get_frames_per_second(), 1000.0 / max(Engine.get_frames_per_second(), 1)]
 	text += "Simulation: %.3f ms | pass complete: %s\n" % [stats.get("sim_ms", 0.0), stats.get("pass_completed", false)]
 	text += "Chunks: active=%d sleeping=%d total=%d\n" % [stats.get("active_chunks", 0), stats.get("sleeping_chunks", 0), stats.get("total_chunks", 0)]
+	var residency: Dictionary = chunk_renderer.get_residency_stats()
+	text += "Render resources: resident=%d/%d (%.1f%%)\n" % [
+		residency.get("resident_count", 0), residency.get("total_chunks", 0),
+		100.0 * residency.get("resident_count", 0) / max(residency.get("total_chunks", 1), 1)
+	]
 	text += "Cells: total=%s evaluated/step=%d moved/step=%d\n" % [_fmt(stats.get("total_cells", 0)), stats.get("cells_evaluated", 0), stats.get("cells_moved", 0)]
 	text += "Reactions: checks/step=%d executed/step=%d\n" % [stats.get("reaction_checks", 0), stats.get("reactions_executed", 0)]
 	text += "\nIron Ore: %d   Copper Ore: %d\n" % [main.get_resource(sim_world.MATERIAL_IRON_ORE), main.get_resource(sim_world.MATERIAL_COPPER_ORE)]
@@ -114,6 +119,15 @@ func _draw_chunk_overlay() -> void:
 	for c in active:
 		active_set[c] = true
 
+	# Resident region (Phase 1 - Lazy Rendering): drawn as a bright outline
+	# so it's visually obvious which chunks currently hold a render resource
+	# (Sprite2D/Image/ImageTexture) vs. which are simulation-only. Iterating
+	# the world's full chunk grid here (like the active-chunk pass above) is
+	# this debug view's own, pre-existing cost - toggled off by default (F1),
+	# not something Phase 1 needed to change.
+	var residency: Dictionary = chunk_renderer.get_residency_stats()
+	var resident_rect: Rect2i = residency.get("resident_rect", Rect2i())
+
 	var chunk_size: int = sim_world.get_chunk_size()
 	var cell_size: int = sim_world.get_simulation_cell_size()
 	var px := chunk_size * cell_size
@@ -123,5 +137,12 @@ func _draw_chunk_overlay() -> void:
 			var coord := Vector2i(cx, cy)
 			var rect := Rect2(Vector2(cx * px, cy * px), Vector2(px, px))
 			var is_active: bool = active_set.has(coord)
-			var color := Color(1, 0.3, 0.3, 0.9) if is_active else Color(0.3, 0.3, 0.3, 0.35)
+			var is_resident: bool = resident_rect.has_point(coord)
+			var color: Color
+			if is_active:
+				color = Color(1, 0.3, 0.3, 0.9)
+			elif is_resident:
+				color = Color(0.3, 0.9, 1.0, 0.5) # resident (has render resource), simulation-idle
+			else:
+				color = Color(0.3, 0.3, 0.3, 0.35) # non-resident, simulation-only
 			chunk_overlay.draw_rect(rect, color, false, 1.0)

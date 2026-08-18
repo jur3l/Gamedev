@@ -358,4 +358,22 @@ bool World::consume_render_dirty(int cx, int cy) {
     return true;
 }
 
+RenderDirtyRect World::consume_render_dirty_rect(int cx, int cy) {
+    RenderDirtyRect result;
+    if (!chunk_in_bounds(cx, cy)) return result;
+    Chunk &c = chunk_at(cx, cy);
+    if (!c.render_dirty) return result;
+    result.was_dirty = true;
+    result.has_rect = c.has_touched_rect();
+    if (result.has_rect) {
+        result.min_x = c.touched_min_x;
+        result.min_y = c.touched_min_y;
+        result.max_x = c.touched_max_x;
+        result.max_y = c.touched_max_y;
+    }
+    c.render_dirty = false;
+    c.reset_touched_rect();
+    return result;
+}
+
 } // namespace pixelsim

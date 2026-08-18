@@ -24,6 +24,16 @@ struct MineResult {
     int total_removed = 0;
 };
 
+// Result of World::consume_render_dirty_rect() - see its declaration below
+// and PERFORMANCE_SCALABILITY.md "Rendering Scaling" for why this exists
+// (avoiding a full 4096-cell re-serialize for a chunk where only a handful
+// of cells actually changed).
+struct RenderDirtyRect {
+    bool was_dirty = false; // chunk was render-dirty (same meaning as consume_render_dirty()'s bool return)
+    bool has_rect = false;  // a valid touched-rect was available (false => caller must fall back to full chunk)
+    int min_x = 0, min_y = 0, max_x = 0, max_y = 0; // local chunk coords, inclusive
+};
+
 // Mining tool footprint. Deliberately just a shape + a single size value
 // (radius for CIRCLE, half-side-length for SQUARE) rather than a generic
 // mask, so it stays trivial to extend with new shapes later.
@@ -147,6 +157,18 @@ public:
     // Consumes (and clears) the render-dirty flag for a chunk. Returns false
     // if the chunk wasn't render-dirty.
     bool consume_render_dirty(int cx, int cy);
+
+    // Same consuming-read contract as consume_render_dirty() (clears
+    // render_dirty and resets the touched-rect), but captures the
+    // touched-rect BOUNDS before clearing them, so a caller can upload just
+    // that sub-region instead of always re-serializing the whole chunk - see
+    // PERFORMANCE_SCALABILITY.md "Rendering Scaling". `has_rect` is false
+    // whenever there is no valid touched-rect to report - in particular,
+    // when render_dirty was set by a Background-only write (TERRAIN_LAYERS.md
+    // set_background() deliberately never touches the touched-rect, since a
+    // background change can affect any cell currently AIR, not a bounded
+    // region) - callers MUST fall back to a full-chunk read in that case.
+    RenderDirtyRect consume_render_dirty_rect(int cx, int cy);
 
     uint64_t total_cell_count() const { return static_cast<uint64_t>(width_cells()) * height_cells(); }
 

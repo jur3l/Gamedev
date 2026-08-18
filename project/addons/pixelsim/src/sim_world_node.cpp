@@ -10,6 +10,29 @@
 
 using namespace pixelsim;
 
+namespace {
+// Shared by get_chunk_pixels() and get_chunk_pixels_rect() so the
+// compositing rule (TERRAIN_LAYERS.md "Rendering": foreground wins wherever
+// it isn't AIR, otherwise the background shows through) is defined exactly
+// once, not duplicated between a full-chunk and a partial-rect code path.
+inline void composite_pixel(uint8_t *dst, const Chunk &chunk, int lx, int ly) {
+    const Cell &cell = chunk.at(lx, ly);
+    if (cell.get_material() == MaterialType::AIR) {
+        const BackgroundDef &bg = get_background_def(chunk.get_background(lx, ly));
+        dst[0] = bg.color_r;
+        dst[1] = bg.color_g;
+        dst[2] = bg.color_b;
+        dst[3] = bg.color_a;
+    } else {
+        const MaterialDef &def = get_material_def(cell.material);
+        dst[0] = def.color_r;
+        dst[1] = def.color_g;
+        dst[2] = def.color_b;
+        dst[3] = def.color_a;
+    }
+}
+} // namespace
+
 namespace godot {
 
 PixelSimWorld::PixelSimWorld() {}
@@ -54,6 +77,7 @@ void PixelSimWorld::_bind_methods() {
     ClassDB::bind_method(D_METHOD("get_world_size_cells"), &PixelSimWorld::get_world_size_cells);
     ClassDB::bind_method(D_METHOD("get_world_size_chunks"), &PixelSimWorld::get_world_size_chunks);
     ClassDB::bind_method(D_METHOD("get_chunk_pixels", "cx", "cy"), &PixelSimWorld::get_chunk_pixels);
+    ClassDB::bind_method(D_METHOD("get_chunk_pixels_rect", "cx", "cy", "x", "y", "w", "h"), &PixelSimWorld::get_chunk_pixels_rect);
     ClassDB::bind_method(D_METHOD("get_and_clear_dirty_render_chunks"), &PixelSimWorld::get_and_clear_dirty_render_chunks);
     ClassDB::bind_method(D_METHOD("get_active_chunk_coords"), &PixelSimWorld::get_active_chunk_coords);
     ClassDB::bind_method(D_METHOD("get_sleeping_chunk_coords"), &PixelSimWorld::get_sleeping_chunk_coords);
@@ -211,28 +235,30 @@ PackedByteArray PixelSimWorld::get_chunk_pixels(int cx, int cy) {
     bytes.resize(CHUNK_CELL_COUNT * 4);
     const Chunk &chunk = world_->chunk_at(cx, cy);
     uint8_t *w = bytes.ptrw();
-    // Compositing rule (TERRAIN_LAYERS.md "Rendering"): foreground wins
-    // wherever it isn't AIR; otherwise the background (BackgroundType::NONE
-    // renders fully transparent) shows through. This is the single place
-    // that decision is made - colors themselves come from MATERIAL_TABLE /
-    // BACKGROUND_TABLE, never a literal here.
     for (int ly = 0; ly < CHUNK_SIZE; ++ly) {
         for (int lx = 0; lx < CHUNK_SIZE; ++lx) {
-            const Cell &cell = chunk.at(lx, ly);
             size_t idx = (static_cast<size_t>(ly) * CHUNK_SIZE + lx) * 4;
-            if (cell.get_material() == MaterialType::AIR) {
-                const BackgroundDef &bg = get_background_def(chunk.get_background(lx, ly));
-                w[idx + 0] = bg.color_r;
-                w[idx + 1] = bg.color_g;
-                w[idx + 2] = bg.color_b;
-                w[idx + 3] = bg.color_a;
-            } else {
-                const MaterialDef &def = get_material_def(cell.material);
-                w[idx + 0] = def.color_r;
-                w[idx + 1] = def.color_g;
-                w[idx + 2] = def.color_b;
-                w[idx + 3] = def.color_a;
-            }
+            composite_pixel(w + idx, chunk, lx, ly);
+        }
+    }
+    return bytes;
+}
+
+PackedByteArray PixelSimWorld::get_chunk_pixels_rect(int cx, int cy, int x, int y, int w, int h) {
+    PackedByteArray bytes;
+    if (!world_ || !world_->chunk_in_bounds(cx, cy)) {
+        return bytes;
+    }
+    if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > CHUNK_SIZE || y + h > CHUNK_SIZE) {
+        return bytes;
+    }
+    bytes.resize(static_cast<size_t>(w) * h * 4);
+    const Chunk &chunk = world_->chunk_at(cx, cy);
+    uint8_t *out = bytes.ptrw();
+    for (int ly = 0; ly < h; ++ly) {
+        for (int lx = 0; lx < w; ++lx) {
+            size_t idx = (static_cast<size_t>(ly) * w + lx) * 4;
+            composite_pixel(out + idx, chunk, x + lx, y + ly);
         }
     }
     return bytes;
@@ -244,9 +270,20 @@ Array PixelSimWorld::get_and_clear_dirty_render_chunks() {
     int cw = world_->width_chunks(), ch = world_->height_chunks();
     for (int cy = 0; cy < ch; ++cy) {
         for (int cx = 0; cx < cw; ++cx) {
-            if (world_->consume_render_dirty(cx, cy)) {
-                out.push_back(Vector2i(cx, cy));
+            RenderDirtyRect r = world_->consume_render_dirty_rect(cx, cy);
+            if (!r.was_dirty) continue;
+            Dictionary entry;
+            entry["coord"] = Vector2i(cx, cy);
+            if (r.has_rect) {
+                entry["full"] = false;
+                entry["x"] = r.min_x;
+                entry["y"] = r.min_y;
+                entry["w"] = r.max_x - r.min_x + 1;
+                entry["h"] = r.max_y - r.min_y + 1;
+            } else {
+                entry["full"] = true;
             }
+            out.push_back(entry);
         }
     }
     return out;

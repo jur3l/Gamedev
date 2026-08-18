@@ -102,8 +102,19 @@ public:
     Vector2i get_world_size_cells() const;
     Vector2i get_world_size_chunks() const;
     PackedByteArray get_chunk_pixels(int cx, int cy);
-    // Returns Array of Vector2i chunk coords whose texture needs re-upload,
-    // and clears their render-dirty flag as a side effect (consuming read).
+    // Same RGBA8 compositing as get_chunk_pixels(), but only for the
+    // sub-rectangle [x, x+w) x [y, y+h) of the chunk (local coords) - see
+    // PERFORMANCE_SCALABILITY.md "Rendering Scaling". Returns an empty array
+    // if the chunk is out of bounds or the rect is degenerate.
+    PackedByteArray get_chunk_pixels_rect(int cx, int cy, int x, int y, int w, int h);
+    // Returns an Array of Dictionaries, one per chunk whose texture needs
+    // re-upload, and clears their render-dirty flag as a side effect
+    // (consuming read) - same single full-chunk-list-scan cost as before,
+    // just returning more per-chunk information. Each entry:
+    //   "coord": Vector2i, "full": bool (true => no valid touched-rect,
+    //   caller must re-read the whole chunk via get_chunk_pixels()),
+    //   and when "full" is false: "x", "y", "w", "h" (the touched sub-rect,
+    //   local chunk coords) for use with get_chunk_pixels_rect().
     Array get_and_clear_dirty_render_chunks();
     Array get_active_chunk_coords();
     Array get_sleeping_chunk_coords();
