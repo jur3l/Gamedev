@@ -129,6 +129,40 @@ All five tiers reached `SETTLED` — no timeouts. **Time to settle grows from 5.
 
 All five tiers reached `SETTLED` with `Fresh Scene: yes` confirmed — no timeouts, no invalid tiers. **Time to settle grows from 3.10s (10k) to 15.36s (500k), a ~5.0× real-time difference for a 50× cell-count difference**, now measured from a genuinely identical starting condition every time. This is the credible baseline for the next CPU/GPU comparison — every tier's "time to settle" reflects only that tier's own SAND falling onto the same empty, freshly-generated terrain, nothing else.
 
+**Superseded by [Stress Test Benchmark Mode](#stress-test-benchmark-mode-v-sync--fps-ceiling) below.** Kept here, unmodified, as the record of what an isolated-but-still-V-Sync-capped run produced.
+
+---
+
+## Stress Test Benchmark Mode (V-Sync / FPS Ceiling)
+
+**Problem:** the isolated-tier table above was still run with the display's default V-Sync enabled. On this environment's 240 Hz monitor, that caps `Engine.get_frames_per_second()` at ~240 — but it also caps something more consequential than the *reported* number: this codebase's simulation tick runs inside `_process()` (`main.gd` → `PixelSimWorld::step_simulation()`), the same callback rendering uses, so a V-Sync-capped frame rate directly caps how many simulation passes can execute per real-world second. A capped run therefore doesn't just under-report FPS/frame-time diagnostics — it makes **Time to Settle itself artificially slower**, since the physics gets fewer real-time chances to advance. This was confirmed directly: the 10k tier's time-to-settle dropped from 3.10s (V-Sync on, capped ~240 Hz) to 1.39s (V-Sync off, this section) purely from removing the presentation-layer ceiling — no simulation code changed.
+
+**Fix:** `_start_test()` now overrides `DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)` and `Engine.max_fps = 0` for the duration of the tier only — both captured beforehand and restored in `_finish_report()`, so normal (non-benchmark) gameplay's presentation settings are never touched by running a stress test. Runtime state is re-validated (not just assumed from having called the setter): `DisplayServer.window_get_vsync_mode()` is re-queried immediately after setting it (in case a platform/fullscreen combination silently refuses to disable V-Sync) and again right before restoring it at test end, with an explicit `** WARNING **` in the report if either check ever fails.
+
+**V-Sync:** disabled for the whole duration of every tier. Never left disabled outside of an active test.
+
+**FPS Measurement:** uncapped — `Engine.max_fps = 0`, verified against the actual display refresh rate (`DisplayServer.screen_get_refresh_rate()`) at test start (`=== BENCHMARK CONFIGURATION ===` block: V-Sync / Display refresh rate / FPS limit), so a future re-measurement on a different machine isn't silently ceiling-capped without anyone noticing.
+
+**Primary Metric:** Time to Full Settle — unchanged, still the number that actually matters. FPS/frame-time are diagnostic only; uncapping them makes those diagnostics *meaningful*, it does not change what's primary (see [Stress Test Measurement Methodology](#stress-test-measurement-methodology) above).
+
+**Secondary Metrics:** avg/min/max FPS, avg/max/p95/p99 frame time (raw per-frame `delta`, not the smoothed `Engine.get_frames_per_second()` value — a genuinely new signal this section adds), avg/max `sim_ms`, peak `active_chunks`, and `passes_completed` (CPU path's natural progress unit — "physical simulation time" in seconds has no meaning here, same rationale as before: `PixelSimWorld::step_simulation()` never uses its own `delta` parameter).
+
+**Frame time vs. simulation time:** reported separately so the split between "total frame cost" and "simulation's own share of it" is visible — e.g. at the 500k tier, avg frame = 4.838 ms vs. avg sim = 3.699 ms, meaning simulation is the majority but not the entirety of frame cost (the remainder being the render pipeline covered in [Rendering Scaling](#rendering-scaling) and rendering-adjacent editor/present overhead this profiling depth doesn't further break down).
+
+**Simulation config unchanged:** V-Sync/FPS-cap removal touches only presentation/frame-pacing. Fixed timestep, tick rate, gravity, `simulation_budget_ms`, the SAND solver, and the GPU solver are all byte-for-byte unmodified — the faster settle times above are a measurement-accuracy correction (removing an artificial ceiling that was throttling real-time simulation throughput), not a physics change.
+
+**Measured** (live, `stop_scene()`/`play_scene()` restart before every tier, `Test Valid: YES` and `V-Sync: OFF` confirmed for every tier before recording, 240 Hz display):
+
+| Tier | Fresh Scene | V-Sync | Sand | Settled | Time to Settle | Avg FPS | Min FPS | Max FPS | Avg Frame ms | Max Frame ms | Avg Sim ms | Peak Active |
+|---:|:---:|:---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | yes | OFF | 10k | yes | 1.39s | 336.8 | 240.0 | 416.0 | 1.880 | 25.705 | 0.732 | 96 |
+| 2 | yes | OFF | 50k | yes | 2.52s | 257.1 | 240.0 | 270.0 | 3.340 | 33.432 | 2.248 | 96 |
+| 3 | yes | OFF | 100k | yes | 4.58s | 270.3 | 240.0 | 284.0 | 3.474 | 33.467 | 2.365 | 96 |
+| 4 | yes | OFF | 250k | yes | 9.55s | 205.5 | 195.0 | 240.0 | 4.771 | 32.546 | 3.502 | 144 |
+| 5 | yes | OFF | 500k | yes | 15.18s | 205.3 | 198.0 | 240.0 | 4.838 | 34.451 | 3.699 | 192 |
+
+All five tiers reached `SETTLED` with `Fresh Scene: yes` and `V-Sync: OFF` confirmed — no timeouts, no invalid tiers. **Two things are visible now that weren't before:** (1) at the light tiers (10k–100k), the achieved FPS (257–337 avg, up to 416 max) genuinely exceeds the 240 Hz display ceiling — proof the earlier V-Sync-capped numbers were an artificial cap, not the real achievable rate; (2) at the heavy tiers (250k–500k), avg FPS settles to ~205, *below* 240 Hz — this is the **real, uncapped performance ceiling** at that load, not a presentation artifact, and is the number that actually matters for a future CPU/GPU comparison. Max frame time (~25–34 ms across every tier) is consistently far above the average — a periodic spike (likely GC/allocation or an occasional heavier chunk-scan pass) worth noting for future investigation, but not addressed here per this milestone's isolation-and-uncapping-only scope. **This is now the credible baseline for the next CPU/GPU comparison** — every number reflects genuinely fresh terrain, an uncapped frame rate, and unmodified physics.
+
 ---
 
 ## Simulation Scaling

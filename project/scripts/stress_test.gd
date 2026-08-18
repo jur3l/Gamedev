@@ -45,6 +45,18 @@ extends Node
 ## immediately before spawning (0 on a truly fresh, already-quiet world -
 ## see "Settled definition" above) and marks the whole run `test_valid =
 ## false`, with an explicit warning in the report, if it wasn't.
+##
+## V-Sync / FPS ceiling (see PERFORMANCE_SCALABILITY.md "Stress Test Benchmark
+## Mode"): a capped V-Sync ties reported FPS to the display's own refresh rate
+## (e.g. ~144 Hz), which hides the actual achievable frame rate above that
+## ceiling - not useful for a performance benchmark. `_start_test()` therefore
+## overrides V-Sync to `DisplayServer.VSYNC_DISABLED` and `Engine.max_fps` to
+## `0` (unlimited) for the duration of the run only - captured beforehand and
+## restored in `_finish_report()`, never touching `project.godot` or normal
+## (non-benchmark) gameplay's presentation settings. FPS/frame-time are still
+## secondary diagnostic metrics only - TIME TO SETTLE remains primary (see
+## "Measurement lifecycle rewrite" above); an uncapped frame rate makes those
+## secondary numbers actually meaningful, it doesn't change what's primary.
 
 const TIERS := {
 	KEY_1: 10000,
@@ -63,6 +75,7 @@ var sim_world: Node
 var measuring := false
 var elapsed := 0.0
 var fps_samples: Array = []
+var frame_time_samples: Array = [] # ms, raw per-frame delta - not the smoothed Engine.get_frames_per_second() value
 var sim_ms_samples: Array = []
 var zero_active_streak := 0
 var passes_completed := 0
@@ -76,6 +89,12 @@ var last_cell_count := 0
 var active_chunks_before_spawn := -1
 var test_valid := true
 var history: Array[Dictionary] = [] # completed tier results, for the summary table
+
+# V-Sync/FPS-cap override state - captured in _start_test(), restored in
+# _finish_report(), so a benchmark run never leaves normal gameplay's
+# presentation settings changed. -1 means "no test has overridden it yet".
+var original_vsync_mode: int = -1
+var original_max_fps: int = -1
 
 func _ready() -> void:
 	sim_world = get_node(sim_world_path)
@@ -94,6 +113,26 @@ func _start_test(cell_count: int) -> void:
 	var stats_before: Dictionary = sim_world.get_stats()
 	active_chunks_before_spawn = stats_before.get("active_chunks", -1)
 	test_valid = (active_chunks_before_spawn == 0)
+
+	# V-Sync/FPS-cap override (see class doc comment "V-Sync / FPS ceiling")
+	# - scoped to this test's lifetime only, restored in _finish_report().
+	original_vsync_mode = DisplayServer.window_get_vsync_mode()
+	original_max_fps = Engine.max_fps
+	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+	Engine.max_fps = 0
+
+	# Runtime validation (not just "we called the setter") - re-query both
+	# right after setting them, since some platform/fullscreen combinations
+	# can silently refuse to disable V-Sync.
+	var actual_vsync_mode: int = DisplayServer.window_get_vsync_mode()
+	var vsync_ok: bool = (actual_vsync_mode == DisplayServer.VSYNC_DISABLED)
+	var fps_cap_ok: bool = (Engine.max_fps == 0)
+	var refresh_rate: float = DisplayServer.screen_get_refresh_rate()
+
+	print("=== BENCHMARK CONFIGURATION ===")
+	print("V-Sync: %s" % ("OFF" if vsync_ok else "FAILED TO DISABLE (mode=%d) - reported FPS may still be ceiling-capped by the display" % actual_vsync_mode))
+	print("Display refresh rate: %.1f Hz" % refresh_rate)
+	print("FPS limit: %s" % ("NONE / UNLIMITED" if fps_cap_ok else "%d (unexpected - Engine.max_fps was not 0)" % Engine.max_fps))
 
 	print("=== STRESS TEST START ===")
 	print("Tier: %d" % cell_count)
@@ -124,6 +163,7 @@ func _start_test(cell_count: int) -> void:
 	measuring = true
 	elapsed = 0.0
 	fps_samples.clear()
+	frame_time_samples.clear()
 	sim_ms_samples.clear()
 	zero_active_streak = 0
 	passes_completed = 0
@@ -140,6 +180,7 @@ func _process(delta: float) -> void:
 	elapsed += delta
 	var fps := Engine.get_frames_per_second()
 	fps_samples.append(fps)
+	frame_time_samples.append(delta * 1000.0)
 
 	var stats: Dictionary = sim_world.get_stats()
 	var sim_ms: float = stats.get("sim_ms", 0.0)
@@ -190,6 +231,30 @@ func _finish_report() -> void:
 		max_sim = max(max_sim, s)
 	avg_sim /= sim_ms_samples.size()
 
+	# Frame time (raw per-frame delta, ms) - the diagnostic that actually
+	# shows render/frame cost once the display-refresh ceiling is removed
+	# (see class doc comment "V-Sync / FPS ceiling"), distinct from
+	# avg_sim/max_sim above (simulation-only cost, a subset of frame cost).
+	var avg_frame_ms := 0.0
+	var max_frame_ms := 0.0
+	for t in frame_time_samples:
+		avg_frame_ms += t
+		max_frame_ms = max(max_frame_ms, t)
+	avg_frame_ms /= frame_time_samples.size()
+	var sorted_frame_times: Array = frame_time_samples.duplicate()
+	sorted_frame_times.sort()
+	var p95_frame_ms: float = _percentile(sorted_frame_times, 0.95)
+	var p99_frame_ms: float = _percentile(sorted_frame_times, 0.99)
+
+	# Runtime re-validation (see class doc comment "V-Sync / FPS ceiling") -
+	# confirm nothing else flipped V-Sync back on mid-test, before restoring
+	# it to whatever normal (non-benchmark) gameplay had before this test.
+	var vsync_still_off: bool = (DisplayServer.window_get_vsync_mode() == DisplayServer.VSYNC_DISABLED)
+	if original_vsync_mode >= 0:
+		DisplayServer.window_set_vsync_mode(original_vsync_mode)
+	if original_max_fps >= 0:
+		Engine.max_fps = original_max_fps
+
 	var result_word := "SETTLED" if settled else "TIMEOUT (did not settle within %.0fs - possible stuck simulation)" % MAX_TEST_DURATION
 
 	# "Physical simulation time" (seconds, independent of wall-clock/FPS) is
@@ -204,9 +269,12 @@ func _finish_report() -> void:
 	var validity_note := ""
 	if not test_valid:
 		validity_note = "\n** WARNING: TEST INVALID - started with active_chunks=%d (not 0). This scene carries state from a previous test; result is not valid for cross-tier comparison. **" % active_chunks_before_spawn
+	var vsync_note := ""
+	if not vsync_still_off:
+		vsync_note = "\n** WARNING: V-Sync was re-enabled mid-test (not by this script) - FPS/frame-time numbers above may be display-refresh-capped. **"
 
-	last_report = "Stress test result (%d SAND cells):\nResult: %s\nTime to settle (wall-clock): %.2f sec\nCPU passes completed: %d (no fixed-timestep physical-time unit on this path - see GPU_GAMEPLAY_INTEGRATION_AUDIT.md)\navg FPS=%.1f  min FPS=%.1f  max FPS=%.1f\navg sim=%.3fms  max sim=%.3fms\npeak active chunks=%d/1344%s" % [
-		last_cell_count, result_word, settle_wall_seconds, passes_completed, avg_fps, min_fps, max_fps, avg_sim, max_sim, peak_active_chunks, validity_note
+	last_report = "Stress test result (%d SAND cells):\nResult: %s\nTime to settle (wall-clock): %.2f sec\nCPU passes completed: %d (no fixed-timestep physical-time unit on this path - see GPU_GAMEPLAY_INTEGRATION_AUDIT.md)\navg FPS=%.1f  min FPS=%.1f  max FPS=%.1f\navg frame=%.3fms  max frame=%.3fms  p95 frame=%.3fms  p99 frame=%.3fms\navg sim=%.3fms  max sim=%.3fms\npeak active chunks=%d/1344%s%s" % [
+		last_cell_count, result_word, settle_wall_seconds, passes_completed, avg_fps, min_fps, max_fps, avg_frame_ms, max_frame_ms, p95_frame_ms, p99_frame_ms, avg_sim, max_sim, peak_active_chunks, validity_note, vsync_note
 	]
 	print("[StressTest] " + last_report.replace("\n", " | "))
 
@@ -215,21 +283,45 @@ func _finish_report() -> void:
 	print("Settled: %s" % ("YES" if settled else "NO (TIMEOUT)"))
 	print("Time to Settle: %.2f sec" % settle_wall_seconds)
 	print("Test Valid: %s" % ("YES" if test_valid else "NO"))
+	print("Fresh Scene: %s" % ("YES" if test_valid else "NO"))
+	print("V-Sync: %s" % ("OFF" if vsync_still_off else "RE-ENABLED (unexpected)"))
+	print("Physical simulation time: N/A on this path (no fixed-timestep concept - CPU passes completed: %d)" % passes_completed)
+	print("Average FPS: %.1f" % avg_fps)
+	print("Minimum FPS: %.1f" % min_fps)
+	print("Maximum FPS: %.1f" % max_fps)
+	print("Average frame time: %.3f ms" % avg_frame_ms)
+	print("Maximum frame time: %.3f ms" % max_frame_ms)
+	print("p95 frame time: %.3f ms" % p95_frame_ms)
+	print("p99 frame time: %.3f ms" % p99_frame_ms)
+	print("Average simulation: %.3f ms" % avg_sim)
+	print("Maximum simulation: %.3f ms" % max_sim)
+	print("Peak active chunks: %d" % peak_active_chunks)
 
 	history.append({
 		"cell_count": last_cell_count,
 		"settled": settled,
 		"timed_out": timed_out,
 		"test_valid": test_valid,
+		"vsync_off": vsync_still_off,
 		"settle_wall_seconds": settle_wall_seconds,
 		"passes_completed": passes_completed,
 		"avg_fps": avg_fps,
 		"min_fps": min_fps,
 		"max_fps": max_fps,
+		"avg_frame_ms": avg_frame_ms,
+		"max_frame_ms": max_frame_ms,
+		"p95_frame_ms": p95_frame_ms,
+		"p99_frame_ms": p99_frame_ms,
 		"avg_sim_ms": avg_sim,
 		"max_sim_ms": max_sim,
 		"peak_active_chunks": peak_active_chunks,
 	})
+
+func _percentile(sorted_values: Array, p: float) -> float:
+	if sorted_values.is_empty():
+		return 0.0
+	var idx: int = clampi(int(ceil(p * sorted_values.size())) - 1, 0, sorted_values.size() - 1)
+	return sorted_values[idx]
 
 func get_report_text() -> String:
 	if measuring:
@@ -247,14 +339,15 @@ func get_summary_table() -> String:
 	if history.is_empty():
 		return ""
 	var lines: Array[String] = []
-	lines.append("| Sand | Fresh Scene | Settled | Time to settle | Avg FPS | Min FPS | Avg Sim ms | Peak Active |")
-	lines.append("|---:|:---:|:---:|---:|---:|---:|---:|---:|")
+	lines.append("| Sand | Fresh Scene | V-Sync | Settled | Time to settle | Avg FPS | Min FPS | Max FPS | Avg Frame ms | Max Frame ms | Avg Sim ms | Peak Active |")
+	lines.append("|---:|:---:|:---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 	for h in history:
 		var settled_word := "yes" if h["settled"] else "TIMEOUT"
 		var fresh_word := "yes" if h["test_valid"] else "NO (INVALID)"
-		lines.append("| %s | %s | %s | %.2fs | %.1f | %.1f | %.3f | %d |" % [
-			_fmt_count(h["cell_count"]), fresh_word, settled_word, h["settle_wall_seconds"],
-			h["avg_fps"], h["min_fps"], h["avg_sim_ms"], h["peak_active_chunks"]
+		var vsync_word := "OFF" if h.get("vsync_off", false) else "ON (unexpected)"
+		lines.append("| %s | %s | %s | %s | %.2fs | %.1f | %.1f | %.1f | %.3f | %.3f | %.3f | %d |" % [
+			_fmt_count(h["cell_count"]), fresh_word, vsync_word, settled_word, h["settle_wall_seconds"],
+			h["avg_fps"], h["min_fps"], h["max_fps"], h["avg_frame_ms"], h["max_frame_ms"], h["avg_sim_ms"], h["peak_active_chunks"]
 		])
 	return "\n".join(lines)
 
