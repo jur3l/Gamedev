@@ -63,11 +63,35 @@ layout(set = 0, binding = 1, std430) restrict writeonly buffer OutBuf {
 }
 output_buf;
 
+// Phase 2D (GPU_ACTIVE_REGION.md "GPU Data Structures") - accumulates the
+// tight bounding box of every cell that actually changed across an entire
+// dispatch BATCH (reset once per batch by the CPU, not once per tick - see
+// GPUSandPoC.step()/step_region()). Purely additive: a full-world dispatch
+// (rect_w == width, rect_h == height) still runs exactly Phase 2A/2B's
+// movement logic, unmodified - this buffer only ever records where activity
+// happened, it never influences what next_val a cell computes.
+layout(set = 0, binding = 2, std430) restrict buffer BoundsBuf {
+    uint min_x;
+    uint min_y;
+    uint max_x;
+    uint max_y;
+}
+bounds_buf;
+
 layout(push_constant, std430) uniform Params {
-    uint width;
-    uint height;
+    uint width;   // full world width - bounds-check reference, unchanged meaning
+    uint height;  // full world height - unchanged meaning
     uint step_index;
     uint seed;
+    // Phase 2D additions (GPU_ACTIVE_REGION.md "GPU Data Structures"): the
+    // dispatched region's origin/size in cell space. A full-world dispatch
+    // (GPUSandPoC.step(), Phase 2C compatibility) always sets
+    // rect = (0, 0, width, height) - identical dispatch shape to before
+    // these fields existed.
+    uint rect_x;
+    uint rect_y;
+    uint rect_w;
+    uint rect_h;
 }
 params;
 
@@ -333,7 +357,12 @@ ivec2 resolve_winner_for(ivec2 dest, uint step_index, uint seed) {
 }
 
 void main() {
-    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    // Phase 2D: dispatched threads cover [rect_x, rect_x+rect_w) x
+    // [rect_y, rect_y+rect_h), not necessarily the whole world - offset by
+    // the rect origin to get the real world position. For a full-world
+    // dispatch (rect_x=rect_y=0), this is identical to Phase 2A/2B's
+    // ivec2(gl_GlobalInvocationID.xy).
+    ivec2 p = ivec2(int(params.rect_x), int(params.rect_y)) + ivec2(gl_GlobalInvocationID.xy);
     if (!in_bounds(p)) {
         return;
     }
@@ -361,4 +390,14 @@ void main() {
     // STATIC (STONE) or AIR-with-no-winner: unchanged.
 
     output_buf.cells[p.y * int(params.width) + p.x] = next_val;
+
+    // Phase 2D: record this cell in the batch's activity bounding box if its
+    // material actually changed - purely observational, never read by
+    // anything above that affects next_val.
+    if (next_val != current) {
+        atomicMin(bounds_buf.min_x, uint(p.x));
+        atomicMin(bounds_buf.min_y, uint(p.y));
+        atomicMax(bounds_buf.max_x, uint(p.x));
+        atomicMax(bounds_buf.max_y, uint(p.y));
+    }
 }

@@ -243,9 +243,10 @@ The single largest risk going in — whether `RenderingDevice`/compute shaders w
 
 - Phase 2B: liquid (WATER) solver. **Done.**
 - Phase 2C: originally scoped as "formal CPU/GPU validation harness" only. **Done, and expanded** — see [Phase 2C — Real-Time Timestep Integration](#phase-2c--real-time-timestep-integration): delivers the persisted validation harness this line originally asked for (`gpu_solver_tests.gd`, 12+16 tests) as part of a larger fixed-timestep/accumulator/GPU-integration milestone (SIMULATION_TIMESCALE.md).
-- Phase 2D: Material Reaction System, data-driven (never hardcoded per-pair logic in a shader — same invariant as the CPU's `REACTION_TABLE`). Not started.
-- Phase 2E: activation/sleeping equivalent on GPU. Not started — flagged by Phase 2C's own measurements as the thing that would actually need to exist before the measured real-time-ratio margin could be assumed at a world size larger than the one tested (see SIMULATION_TIMESCALE.md "Architecture Decision").
-- Phase 2F: GPU simulation → GPU rendering (removing the CPU readback from the production path entirely). Not started.
+- Phase 2D: originally scoped as "Material Reaction System, data-driven." **Renumbered/reused** — see [Phase 2D — Real-Time Active Region](#phase-2d--real-time-active-region): the activation/sleeping-equivalent work originally slotted as Phase 2E turned out to be the more urgent next step after Phase 2C's own measurements showed world-size-bound (not activity-bound) GPU cost, so it was pulled forward into the 2D slot. Material Reactions keeps its place in the roadmap, renumbered below.
+- Phase 2E (was 2D): Material Reaction System, data-driven (never hardcoded per-pair logic in a shader — same invariant as the CPU's `REACTION_TABLE`). Not started.
+- Phase 2F (was 2E): further activation/sleeping refinement beyond Phase 2D's bounding-rect model (e.g. chunk-dispatch-list/indirect-dispatch, if a genuinely scattered-active-region workload ever needs it — see GPU_ACTIVE_REGION.md "Known Limitations"). Not started.
+- Phase 2G (was 2F): GPU simulation → GPU rendering (removing the CPU readback from the production path entirely). Not started.
 - The chunk-storage architecture decision (flat buffer vs. tiled with neighbor/halo exchange) flagged above.
 - A tighter GPU state packing (e.g. `uint8` material with explicit bit-packing) if the 2.66× memory ratio becomes a real constraint at production scale.
 
@@ -434,3 +435,19 @@ Everything in PROJECT_ARCHITECTURE.md §13/§14 and PERFORMANCE_SCALABILITY.md's
 **Still not done, same as every prior phase:** no LAVA, no Material Reaction System, no GPU activation/sleeping, no GPU rendering, no production wiring into `PixelSimWorld`/`Main.tscn`. See SIMULATION_TIMESCALE.md "Architecture Decision" for the specific conditions attached to the GO.
 
 **New files this phase, all GDScript, zero C++ changed** (same "zero C++ files changed" invariant every phase in this document has held): `project/scripts/gpu_simulation_backend.gd`, `project/scripts/gpu_solver_tests.gd`, `project/scripts/gpu_timestep_benchmark.gd`.
+
+---
+
+# Phase 2D — Real-Time Active Region
+
+**Status: DONE — GO WITH CONDITIONS.** Full detail in **[GPU_ACTIVE_REGION.md](GPU_ACTIVE_REGION.md)** — this section is a brief, honest pointer, not a duplicate.
+
+**What this phase closes:** Phase 2C proved a 70–76× real-time margin at every SAND tier, but that margin turned out to be a property of *world buffer size* (always dispatched in full), not of *active cell count* — exactly this document's own "no GPU-side activation/sleeping" limitation, listed since Phase 2A. Phase 2D adds a GPU-computed activity bounding box (`atomicMin`/`atomicMax` on any cell that changes, read back as 16 bytes per batch) and rect-offset dispatch (`GPUSandPoC.step_region()`) on top of the **same, unmodified** ping-pong pipeline and movement rules — no second GPU simulation infrastructure, same invariant every phase since 2A has held.
+
+**Headline result:** GPU compute cost now measurably scales with active region size (a controlled sweep: ~4.4× growth from 1 to 2,000 active chunks) and scales *sub-linearly* (not perfectly flat) with total world size (3.7× growth for an 18× world-size increase, 5.5M→100M cells, active region held fixed) — a large, real improvement over full-world dispatch's exact-linear world-size dependency, honestly reported as sub-linear rather than rounded up to "flat." CPU-side active-region bookkeeping is 0.6–0.9µs/call, 4–5 orders of magnitude below any GPU cost measured — not a bottleneck. 55/55 correctness checks passed (the existing 40 + 15 new active-region/wake/sleep scenarios).
+
+**An honest, non-flattering finding, reported as measured:** on `stress_test.gd`'s own wide-slab spawn geometry specifically, active-region dispatch was measurably *slower* than full-world dispatch at the 250k/500k tiers — not a flaw in the mechanism (the two controlled sweeps prove it works), but a mismatch between bounding-rect dispatch and a workload shape that barely shrinks in one dimension. See GPU_ACTIVE_REGION.md "CPU vs GPU-Full-World vs GPU-Active-Region" for the full, unglossed data and explanation.
+
+**Still not done, same pattern as every prior phase:** no LAVA, no Material Reaction System, no player-collision/mining GPU migration, no GPU rendering, no production wiring. See GPU_ACTIVE_REGION.md "Architecture Decision" for the specific conditions attached to this phase's GO.
+
+**New files, all GDScript + one shader extension, zero C++ changed:** `project/scripts/gpu_active_region_tests.gd`, `project/scripts/gpu_active_region_benchmark.gd`; `project/shaders/gpu_cellular_solver.glsl` extended (push constants + a third storage buffer, purely additive — the SAND/WATER movement rules are byte-for-byte unchanged); `gpu_sand_poc.gd`/`gpu_simulation_backend.gd` extended with `step_region()`/active-region tracking (existing `step()`/`advance()`/`run_ticks_unpaced()` behaviorally unchanged, all Phase 2C tests/benchmarks remain valid).

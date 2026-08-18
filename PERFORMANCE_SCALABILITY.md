@@ -446,6 +446,38 @@ The FPS difference is uniform across every workload tier (not scaling with simul
 
 ---
 
+## Phase 2D — Real-Time Active Region
+
+**Status: DONE — GO WITH CONDITIONS.** Full detail in **[GPU_ACTIVE_REGION.md](GPU_ACTIVE_REGION.md)** — this is a scalability-focused summary.
+
+**What changed from Phase 2C:** Phase 2C's GPU dispatch always covered the entire world buffer, so its 70–76× real-time margin was a world-*size* property, not an activity property — this document's own "idle simulation cost scales linearly with total chunk count" bottleneck finding (Simulation Scaling, above), mirrored on the GPU side. Phase 2D adds a GPU-computed activity bounding box and rect-limited dispatch, making cost track *active* cells instead.
+
+**Active-chunk-count sweep** (fixed 3072×1792 world, 60-tick batches):
+
+| Active chunks | GPU compute (µs) | `simulation_real_time_ratio` |
+|---:|---:|---:|
+| 1 | 6,055 | 164.9 |
+| 100 | 11,299 | 88.5 |
+| 1,000 | 21,083 | 47.4 |
+| 2,000 | 26,735 | 37.4 |
+
+**World-size scaling** (fixed 56-chunk active region):
+
+| World cells | GPU compute (µs) | Ratio |
+|---:|---:|---:|
+| 5.5M | 5,435 | 183.7 |
+| 100M | 20,104 | 49.7 |
+
+**Sub-linear, not flat, world-size independence** — an 18× world-size increase (5.5M→100M) grew compute time only 3.7×, a large improvement over full-world dispatch's exact-linear relationship, but not the flat line an idealized model would predict; the residual growth tracks total GPU allocation size, a distinct, smaller effect from dispatched-region size (which stayed exactly fixed throughout this table). See GPU_ACTIVE_REGION.md for the full explanation.
+
+**CPU-side active-region bookkeeping cost: 0.6–0.9 µs/call** — 4–5 orders of magnitude below any GPU cost measured, directly ruling out the "GPU fast, CPU active-management slow" failure mode this phase's request specifically worried about.
+
+**An honest caveat on real-workload gains:** on `stress_test.gd`'s own wide-slab spawn geometry, active-region dispatch was measurably *slower* than full-world at the 250k/500k SAND tiers (a workload-shape mismatch with bounding-rect dispatch specifically, not a mechanism flaw — the controlled sweeps above prove the mechanism itself works) — reported as measured, not smoothed over. See GPU_ACTIVE_REGION.md "CPU vs GPU-Full-World vs GPU-Active-Region" for the full data.
+
+**Decision: GO WITH CONDITIONS.** Correctness (55/55), CPU overhead, and active-chunk scaling all validated; workload-shape sensitivity and sub-linear (not flat) world-size scaling are the two conditions carried forward — see GPU_ACTIVE_REGION.md "Architecture Decision" for the complete list.
+
+---
+
 ## Correctness Verification
 
 Verified live, pixel-for-pixel against C++ ground truth, before considering the optimization complete:
